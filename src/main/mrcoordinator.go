@@ -20,6 +20,7 @@ func main() {
 		os.Exit(1)
 	}
 
+  // The main task for the coordinator is to response to rpc.
 	m := mr.MakeCoordinator(os.Args[1:], 10)
 	for m.Done() == false {
 		time.Sleep(time.Second)
