@@ -19,13 +19,81 @@ package raft
 
 import (
 	//	"bytes"
+	"fmt"
+	"log"
+	"math/rand"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
 
+type logTopic string
+
+const (
+	dClient  logTopic = "CLNT"
+	dCommit  logTopic = "CMIT"
+	dDrop    logTopic = "DROP"
+	dError   logTopic = "ERRO"
+	dInfo    logTopic = "INFO"
+	dLeader  logTopic = "LEAD"
+	dLog     logTopic = "LOG1"
+	dLog2    logTopic = "LOG2"
+	dPersist logTopic = "PERS"
+	dSnap    logTopic = "SNAP"
+	dTerm    logTopic = "TERM"
+	dTest    logTopic = "TEST"
+	dTimer   logTopic = "TIMR"
+	dTrace   logTopic = "TRCE"
+	dVote    logTopic = "VOTE"
+	dWarn    logTopic = "WARN"
+)
+
+type state int
+
+const (
+	Follower  state = 0
+	Candidate state = 1
+	Leader    state = 2
+)
+
+// Retrieve the verbosity level from an environment variable
+func getVerbosity() int {
+	v := os.Getenv("VERBOSE")
+	level := 0
+	if v != "" {
+		var err error
+		level, err = strconv.Atoi(v)
+		if err != nil {
+			log.Fatalf("Invalid verbosity %v", v)
+		}
+	}
+	return level
+}
+
+var debugStart time.Time
+var debugVerbosity int
+
+func debugInit() {
+	debugVerbosity = getVerbosity()
+	debugStart = time.Now()
+
+	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
+}
+
+func MyDebug(topic logTopic, format string, a ...interface{}) {
+	if debugVerbosity >= 1 {
+		time := time.Since(debugStart).Microseconds()
+		time /= 100
+		prefix := fmt.Sprintf("%06d %v ", time, string(topic))
+		format = prefix + format
+		log.Printf(format, a...)
+	}
+}
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -50,6 +118,9 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+type LogEntires struct {
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -63,17 +134,39 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	currentTerm int
+	// -1 indicates that not voted in this round.
+	votedFor int
 
+	log []LogEntires
+	// volatile states on all servers
+	commitIndex int
+	lastApplied int
+
+	// leader states that are reinitialized after election.
+	nextIndex  []int
+	matchIndex []int
+
+	state state
+}
+
+// Let's say the leader sends the heartbeats at interval 120ms
+// And the timeout time is 300-500ms
+const LOWEST_INTERVAL = 300
+
+// Return a value in range [LOWEST_INTERVAL, LOWEST_INTERVAL + 200)
+func getRandomValue() int32 {
+	// Generate a new seed each time this is accessed
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	return r.Int31n(200) + LOWEST_INTERVAL
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
-	return term, isleader
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.state == Leader
 }
 
 //
@@ -91,7 +184,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -115,7 +207,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
@@ -135,7 +226,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 
 }
-
 
 //
 // example RequestVote RPC arguments structure.
@@ -194,7 +284,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -215,7 +304,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -243,13 +331,20 @@ func (rf *Raft) killed() bool {
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
+// If we are the leader, we can simply ignore this function, otherwise we do other things.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		sleep := getRandomValue()
+		MyDebug(dTimer, "S%d Reset value %d", rf.me, sleep)
 
+		time.Sleep(time.Duration(sleep) * time.Millisecond)
+		// If election timeout elapses without receiving AppendEntires RPC
+		// from current leader or granting vote to candidate: convert to candidate
+		// Check if we need to startElection
 	}
 }
 
@@ -272,13 +367,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-
+	debugInit()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.currentTerm = 0
+	rf.votedFor = -1
+
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+
+	// We use lazy allocation -> only allocate this space when needed
+	rf.nextIndex = nil
+	rf.matchIndex = nil
+	// Use append to add new entries into the log
+	rf.log = make([]LogEntires, 0)
+	rf.state = Follower
+
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
