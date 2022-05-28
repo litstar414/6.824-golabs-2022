@@ -77,8 +77,11 @@ func getVerbosity() int {
 
 var debugStart time.Time
 var debugVerbosity int
+var debugLock sync.Mutex
 
 func debugInit() {
+	debugLock.Lock()
+	defer debugLock.Unlock()
 	debugVerbosity = getVerbosity()
 	debugStart = time.Now()
 
@@ -86,6 +89,9 @@ func debugInit() {
 }
 
 func MyDebug(topic logTopic, format string, a ...interface{}) {
+	debugLock.Lock()
+	defer debugLock.Unlock()
+
 	if debugVerbosity >= 1 {
 		time := time.Since(debugStart).Microseconds()
 		time /= 100
@@ -361,13 +367,13 @@ func (rf *Raft) ticker() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	debugInit()
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	debugInit()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
