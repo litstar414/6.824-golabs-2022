@@ -554,7 +554,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-const SLEEP_INTERVAL = 1
+const SLEEP_INTERVAL = 5
 
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
