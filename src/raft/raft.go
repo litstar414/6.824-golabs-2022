@@ -153,15 +153,155 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	state state
+	state      state
+	resetTimer chan int
+	lastReset  time.Time
+}
+
+// Invoke under lock
+func (rf *Raft) broadcastAE() {
+	if rf.state != Leader {
+		return
+	}
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		// otherwise, send messages
+		go func(server int, term int) {
+			// held the lock
+			args := AppendEntryArgs{
+				Term:     term,
+				LeaderId: rf.me,
+			}
+			reply := AppendEntryReply{}
+      MyDebug(dLeader, "S%d Leader sends HB to server %d in term %d", rf.me, server, term)
+			ok := rf.sendAppendEntry(server, &args, &reply)
+			if ok {
+				// handle the result
+				// Always check the term
+        MyDebug(dTrace, "S%d tries to acquire the lock in MHAE", rf.me)
+				rf.mu.Lock()
+        defer rf.mu.Unlock()
+        defer MyDebug(dTrace, "S%d release the lock in MHAE", rf.me)
+
+				if rf.checkTerm(reply.Term) {
+					return
+				}
+				if reply.Term != term {
+					// Stale information
+					return
+				}
+				// We always expect a success from peers in 2A
+			}
+		}(i, rf.currentTerm)
+	}
+}
+
+// Invoke this function should held the lock
+func (rf *Raft) broadcastRV() {
+	args := RequestVoteArgs{
+		Term:        rf.currentTerm,
+		CandidateId: rf.me,
+		// TODO: implement LastLogIndex and LastLogTerm
+	}
+
+	done := false
+	count := 1
+	var lock sync.Mutex
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		// Send rpc to other servers
+		go func(server int) {
+			reply := RequestVoteReply{}
+			MyDebug(dTimer, "S%d sends request to S%d", rf.me, server)
+			ok := rf.sendRequestVote(server, &args, &reply)
+			MyDebug(dTimer, "S%d received a result from S%d", rf.me, server)
+			if ok {
+				// Check the term
+        MyDebug(dTrace, "S%d tries to acquire the lock in MHRV", rf.me)
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+        defer MyDebug(dTrace, "S%d release the lock in MHRV", rf.me)
+
+				lock.Lock()
+				defer lock.Unlock()
+
+				if rf.checkTerm(reply.Term) {
+					// We failed to become the leader
+					done = true
+					return
+				}
+				if done {
+					// We have already become the leader or failed
+					return
+				}
+				if reply.VoteGranted {
+					count += 1
+					MyDebug(dVote, "S%d Candidate, received vote from S%d in term %d, total count %d", rf.me, server, rf.currentTerm, count)
+					if count > len(rf.peers)/2 {
+						if rf.state == Candidate && rf.currentTerm == args.Term {
+							// This is a valid reply, we become as the leader
+							MyDebug(dLeader, "S%d Leader, has become leader in term %d", rf.me, rf.currentTerm)
+							rf.state = Leader
+							done = true
+							rf.leaderInitialize()
+						}
+					}
+				}
+			}
+		}(i)
+	}
+
+}
+
+// To invoke this function, lock should be held
+// If term gets updated(gets bigger), the votedFor will be updated
+func (rf *Raft) checkTerm(term int) bool {
+	if term > rf.currentTerm {
+		rf.votedFor = -1
+		rf.currentTerm = term
+		if rf.state != Follower {
+			MyDebug(dTimer, "S%d sees a bigger term %d, revert to follower", rf.me, term)
+			rf.state = Follower
+      rf.lastReset = time.Now()
+			// This instruction causes problem
+			//rf.resetTimer <- 1
+		}
+		return true
+	}
+	return false
+}
+
+// Invoke this function should held the lock
+// Before return from this function, the lock should be held
+func (rf *Raft) converToCandidate() {
+	rf.state = Candidate
+	rf.lastReset = time.Now()
+	rf.currentTerm += 1
+	rf.votedFor = rf.me
+	rf.broadcastRV()
+}
+
+// Invoke this function should held the lock
+// Before return from this function, the lock should be held
+func (rf *Raft) leaderInitialize() {
+  rf.broadcastAE()
+  rf.lastReset = time.Now()
 }
 
 // Let's say the leader sends the heartbeats at interval 120ms
 // And the timeout time is 300-500ms
-const LOWEST_INTERVAL = 300
+const LOWEST_INTERVAL = 500
 
 // Return a value in range [LOWEST_INTERVAL, LOWEST_INTERVAL + 200)
-func getRandomValue() int32 {
+func (rf *Raft) getRandomValue() int32 {
+	if rf.state == Leader {
+		return 120
+	}
 	// Generate a new seed each time this is accessed
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	return r.Int31n(200) + LOWEST_INTERVAL
@@ -239,6 +379,20 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type AppendEntryArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+
+	Entries      []LogEntires
+	LeaderCommit int
 }
 
 //
@@ -247,6 +401,43 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+type AppendEntryReply struct {
+	Term    int
+	Success bool
+}
+
+// AEhandler
+func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
+  MyDebug(dTrace, "S%d tries to acquire lock in AE handler", rf.me)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+  defer MyDebug(dTrace, "S%d release the lock in AE handler", rf.me)
+
+	rf.checkTerm(args.Term)
+	if args.Term < rf.currentTerm {
+		MyDebug(dTimer, "S%d received a stale appendEntires from old leader", rf.me)
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+	// If u are candidate, then after receiving messages from new leader, convert to follower
+	if rf.state == Candidate {
+		MyDebug(dTimer, "S%d Candidate, received AE, convert back to follower", rf.me)
+		rf.state = Follower
+		reply.Success = true
+		reply.Term = rf.currentTerm
+    rf.lastReset = time.Now()
+	} else {
+		reply.Success = true
+		reply.Term = rf.currentTerm
+    rf.lastReset = time.Now()
+		MyDebug(dTimer, "S%d Follower, received AE, reset timer", rf.me)
+	}
+
 }
 
 //
@@ -254,6 +445,30 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+  MyDebug(dTrace, "S%d tries to acquire lock in RV handler", rf.me)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+  defer MyDebug(dTrace, "S%d release the lock in RV handler", rf.me)
+
+	rf.checkTerm(args.Term)
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		MyDebug(dVote, "S%d reject vote request from S%d in term %d", rf.me, args.CandidateId, rf.currentTerm)
+		reply.VoteGranted = false
+		return
+	}
+
+	// TODO: compare logs
+
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		rf.votedFor = args.CandidateId
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = true
+		MyDebug(dVote, "S%d Follower votes for S%d in term %d", rf.me, args.CandidateId, rf.currentTerm)
+		// the resetTimer channel blocks here
+    rf.lastReset = time.Now()
+		return
+	}
 }
 
 //
@@ -287,6 +502,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
 	return ok
 }
 
@@ -335,22 +554,61 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+const SLEEP_INTERVAL = 1
+
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 // If we are the leader, we can simply ignore this function, otherwise we do other things.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
+		time.Sleep(SLEEP_INTERVAL * time.Millisecond)
+    MyDebug(dTrace, "S%d tries to acquire lock in main thread", rf.me)
+		rf.mu.Lock()
+		switch rf.state {
+		case Follower:
+      if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()){
+				MyDebug(dTimer, "S%d Follower, timesout become Candidate in term %d", rf.me, rf.currentTerm+1)
+				rf.converToCandidate()
+			}
+		case Candidate:
+      if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()){
+				MyDebug(dTimer, "S%d Candidate, timesout Candidate again in term %d", rf.me, rf.currentTerm+1)
+				rf.converToCandidate()
+			}
+		case Leader:
+      if time.Since(rf.lastReset).Milliseconds() > 120 {
+        rf.lastReset = time.Now()
+				MyDebug(dTimer, "S%d Leader, sends heartbeats in term %d", rf.me, rf.currentTerm)
+				rf.broadcastAE()
+			}
+		}
+    MyDebug(dTrace, "S%d releases the lock in main thread", rf.me)
+		rf.mu.Unlock()
+
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		sleep := getRandomValue()
-		MyDebug(dTimer, "S%d Reset value %d", rf.me, sleep)
 
-		time.Sleep(time.Duration(sleep) * time.Millisecond)
-		// If election timeout elapses without receiving AppendEntires RPC
-		// from current leader or granting vote to candidate: convert to candidate
-		// Check if we need to startElection
+		// The sleep time should based on the identity of the server
+
+		/*   select {*/
+		/*case <-time.After(time.Duration(rf.getRandomValue()) * time.Millisecond):*/
+		/*rf.mu.Lock()*/
+		/*switch rf.state {*/
+		/*case Follower:*/
+		/*MyDebug(dTimer, "S%d Follower, timesout become Candidate in term %d", rf.me, rf.currentTerm+1)*/
+		/*rf.converToCandidate()*/
+		/*case Candidate:*/
+		/*MyDebug(dTimer, "S%d Candidate, timesout Candidate again in term %d", rf.me, rf.currentTerm+1)*/
+		/*rf.converToCandidate()*/
+		/*case Leader:*/
+		/*MyDebug(dTimer, "S%d Leader, sends heartbeats in term %d", rf.me, rf.currentTerm)*/
+		/*rf.broadcastAE()*/
+		/*}*/
+		/*rf.mu.Unlock()*/
+		/*case <-rf.resetTimer:*/
+		/*}*/
 	}
 }
 
@@ -389,6 +647,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Use append to add new entries into the log
 	rf.log = make([]LogEntires, 0)
 	rf.state = Follower
+
+	rf.resetTimer = make(chan int)
+	rf.lastReset = time.Now()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
