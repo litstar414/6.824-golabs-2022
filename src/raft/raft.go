@@ -124,7 +124,13 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-type LogEntires struct {
+// Each log entry stores a state machine command along with the
+// term number when the entry was received by the leader
+// Each log also has an integer index identifying its position in the log.
+type LogEntry struct {
+	Command interface{}
+	Index   int
+	Term    int
 }
 
 //
@@ -144,7 +150,7 @@ type Raft struct {
 	// -1 indicates that not voted in this round.
 	votedFor int
 
-	log []LogEntires
+	log []LogEntry
 	// volatile states on all servers
 	commitIndex int
 	lastApplied int
@@ -153,9 +159,8 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	state      state
-	resetTimer chan int
-	lastReset  time.Time
+	state     state
+	lastReset time.Time
 }
 
 // Invoke under lock
@@ -175,15 +180,15 @@ func (rf *Raft) broadcastAE() {
 				LeaderId: rf.me,
 			}
 			reply := AppendEntryReply{}
-      MyDebug(dLeader, "S%d Leader sends HB to server %d in term %d", rf.me, server, term)
+			MyDebug(dLeader, "S%d Leader sends HB to server %d in term %d", rf.me, server, term)
 			ok := rf.sendAppendEntry(server, &args, &reply)
 			if ok {
 				// handle the result
 				// Always check the term
-        MyDebug(dTrace, "S%d tries to acquire the lock in MHAE", rf.me)
+				MyDebug(dTrace, "S%d tries to acquire the lock in MHAE", rf.me)
 				rf.mu.Lock()
-        defer rf.mu.Unlock()
-        defer MyDebug(dTrace, "S%d release the lock in MHAE", rf.me)
+				defer rf.mu.Unlock()
+				defer MyDebug(dTrace, "S%d release the lock in MHAE", rf.me)
 
 				if rf.checkTerm(reply.Term) {
 					return
@@ -222,10 +227,10 @@ func (rf *Raft) broadcastRV() {
 			MyDebug(dTimer, "S%d received a result from S%d", rf.me, server)
 			if ok {
 				// Check the term
-        MyDebug(dTrace, "S%d tries to acquire the lock in MHRV", rf.me)
+				MyDebug(dTrace, "S%d tries to acquire the lock in MHRV", rf.me)
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-        defer MyDebug(dTrace, "S%d release the lock in MHRV", rf.me)
+				defer MyDebug(dTrace, "S%d release the lock in MHRV", rf.me)
 
 				lock.Lock()
 				defer lock.Unlock()
@@ -267,7 +272,7 @@ func (rf *Raft) checkTerm(term int) bool {
 		if rf.state != Follower {
 			MyDebug(dTimer, "S%d sees a bigger term %d, revert to follower", rf.me, term)
 			rf.state = Follower
-      rf.lastReset = time.Now()
+			rf.lastReset = time.Now()
 			// This instruction causes problem
 			//rf.resetTimer <- 1
 		}
@@ -289,8 +294,15 @@ func (rf *Raft) converToCandidate() {
 // Invoke this function should held the lock
 // Before return from this function, the lock should be held
 func (rf *Raft) leaderInitialize() {
-  rf.broadcastAE()
-  rf.lastReset = time.Now()
+	rf.broadcastAE()
+	rf.lastReset = time.Now()
+	// re-initialize nextIndex and matchIndex
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = 0
+	}
 }
 
 // Let's say the leader sends the heartbeats at interval 120ms
@@ -391,7 +403,7 @@ type AppendEntryArgs struct {
 	PrevLogIndex int
 	PrevLogTerm  int
 
-	Entries      []LogEntires
+	Entries      []LogEntry
 	LeaderCommit int
 }
 
@@ -412,10 +424,10 @@ type AppendEntryReply struct {
 
 // AEhandler
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
-  MyDebug(dTrace, "S%d tries to acquire lock in AE handler", rf.me)
+	MyDebug(dTrace, "S%d tries to acquire lock in AE handler", rf.me)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-  defer MyDebug(dTrace, "S%d release the lock in AE handler", rf.me)
+	defer MyDebug(dTrace, "S%d release the lock in AE handler", rf.me)
 
 	rf.checkTerm(args.Term)
 	if args.Term < rf.currentTerm {
@@ -430,11 +442,11 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		rf.state = Follower
 		reply.Success = true
 		reply.Term = rf.currentTerm
-    rf.lastReset = time.Now()
+		rf.lastReset = time.Now()
 	} else {
 		reply.Success = true
 		reply.Term = rf.currentTerm
-    rf.lastReset = time.Now()
+		rf.lastReset = time.Now()
 		MyDebug(dTimer, "S%d Follower, received AE, reset timer", rf.me)
 	}
 
@@ -445,10 +457,10 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-  MyDebug(dTrace, "S%d tries to acquire lock in RV handler", rf.me)
+	MyDebug(dTrace, "S%d tries to acquire lock in RV handler", rf.me)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-  defer MyDebug(dTrace, "S%d release the lock in RV handler", rf.me)
+	defer MyDebug(dTrace, "S%d release the lock in RV handler", rf.me)
 
 	rf.checkTerm(args.Term)
 	if args.Term < rf.currentTerm {
@@ -466,7 +478,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		MyDebug(dVote, "S%d Follower votes for S%d in term %d", rf.me, args.CandidateId, rf.currentTerm)
 		// the resetTimer channel blocks here
-    rf.lastReset = time.Now()
+		rf.lastReset = time.Now()
 		return
 	}
 }
@@ -524,13 +536,33 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	MyDebug(dTrace, "S%d tries to acquire the lock in Start", rf.me)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	defer MyDebug(dTrace, "S%d release the lock in Start", rf.me)
 
-	return index, term, isLeader
+	// First check if me is the leader or not
+	if rf.state != Leader {
+		// The index and term only has meaning when it's the leader
+		return -1, -1, false
+	}
+	// Generate the LogEntry
+	log := LogEntry{
+		Command: command,
+		Term:    rf.currentTerm,
+		Index:   len(rf.log),
+	}
+
+	// Append to its own log
+	rf.log = append(rf.log, log)
+
+	// Reset the timer for leader as we are about to send messages
+	rf.lastReset = time.Now()
+	rf.broadcastAE()
+
+	// Return immediately from the function, don't wait for results
+	return len(rf.log) - 1, rf.currentTerm, true
 }
 
 //
@@ -560,55 +592,37 @@ const SLEEP_INTERVAL = 5
 // heartsbeats recently.
 // If we are the leader, we can simply ignore this function, otherwise we do other things.
 func (rf *Raft) ticker() {
+	// Your code here to check if a leader election should
+	// be started and to randomize sleeping time using
+	// time.Sleep().
+
+	// The sleep time should based on the identity of the server
+
 	for rf.killed() == false {
 
 		time.Sleep(SLEEP_INTERVAL * time.Millisecond)
-    MyDebug(dTrace, "S%d tries to acquire lock in main thread", rf.me)
+		MyDebug(dTrace, "S%d tries to acquire lock in main thread", rf.me)
 		rf.mu.Lock()
 		switch rf.state {
 		case Follower:
-      if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()){
+			if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()) {
 				MyDebug(dTimer, "S%d Follower, timesout become Candidate in term %d", rf.me, rf.currentTerm+1)
 				rf.converToCandidate()
 			}
 		case Candidate:
-      if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()){
+			if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()) {
 				MyDebug(dTimer, "S%d Candidate, timesout Candidate again in term %d", rf.me, rf.currentTerm+1)
 				rf.converToCandidate()
 			}
 		case Leader:
-      if time.Since(rf.lastReset).Milliseconds() > 120 {
-        rf.lastReset = time.Now()
+			if time.Since(rf.lastReset).Milliseconds() > 120 {
+				rf.lastReset = time.Now()
 				MyDebug(dTimer, "S%d Leader, sends heartbeats in term %d", rf.me, rf.currentTerm)
 				rf.broadcastAE()
 			}
 		}
-    MyDebug(dTrace, "S%d releases the lock in main thread", rf.me)
+		MyDebug(dTrace, "S%d releases the lock in main thread", rf.me)
 		rf.mu.Unlock()
-
-		// Your code here to check if a leader election should
-		// be started and to randomize sleeping time using
-		// time.Sleep().
-
-		// The sleep time should based on the identity of the server
-
-		/*   select {*/
-		/*case <-time.After(time.Duration(rf.getRandomValue()) * time.Millisecond):*/
-		/*rf.mu.Lock()*/
-		/*switch rf.state {*/
-		/*case Follower:*/
-		/*MyDebug(dTimer, "S%d Follower, timesout become Candidate in term %d", rf.me, rf.currentTerm+1)*/
-		/*rf.converToCandidate()*/
-		/*case Candidate:*/
-		/*MyDebug(dTimer, "S%d Candidate, timesout Candidate again in term %d", rf.me, rf.currentTerm+1)*/
-		/*rf.converToCandidate()*/
-		/*case Leader:*/
-		/*MyDebug(dTimer, "S%d Leader, sends heartbeats in term %d", rf.me, rf.currentTerm)*/
-		/*rf.broadcastAE()*/
-		/*}*/
-		/*rf.mu.Unlock()*/
-		/*case <-rf.resetTimer:*/
-		/*}*/
 	}
 }
 
@@ -645,10 +659,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = nil
 	rf.matchIndex = nil
 	// Use append to add new entries into the log
-	rf.log = make([]LogEntires, 0)
+	rf.log = make([]LogEntry, 0)
 	rf.state = Follower
 
-	rf.resetTimer = make(chan int)
 	rf.lastReset = time.Now()
 
 	// start ticker goroutine to start elections
