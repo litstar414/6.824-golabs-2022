@@ -183,6 +183,7 @@ func (rf *Raft) broadcastAE() {
 		leaderCommit := -1
 
 		// When we delete elements in the log, we must also change its length.
+		// What if nextIndex[i] is 0?
 		if rf.nextIndex[i] > len(rf.log) {
 			// we dont have anything new to send out.
 			entries = nil
@@ -257,19 +258,24 @@ func (rf *Raft) broadcastAE() {
 					// Decrement nextIndex and retry
 					// Ensure we does not see any changes in the nextIndex
 					if rf.nextIndex[server] == args.PrevLogIndex+1 {
+            MyDebug(dLog, "S%d Leader received suggested(%d) Term:%d Next:%d", rf.me, server, reply.ConflictTerm, reply.Next)
 						if reply.Next == -1 {
 							rf.nextIndex[server] -= 1
+            MyDebug(dLog, "S%d Leader received suggested(%d) -1 to %d", rf.me, server, rf.nextIndex[server])
 						} else {
 							if reply.ConflictTerm == -1 {
 								rf.nextIndex[server] = reply.Next
+                MyDebug(dLog, "S%d Leader received suggested(%d) Next to %d", rf.me, server, rf.nextIndex[server])
 							} else {
 								// Do we have term in our log?
 								temp := args.PrevLogIndex
-								for ; rf.log[temp-1].Term > reply.ConflictTerm && temp >= 1; temp-- {
+								for ; rf.log[temp-1].Term > reply.ConflictTerm && temp > 1; temp-- {
 								}
 								if rf.log[temp-1].Term == reply.ConflictTerm {
 									rf.nextIndex[server] = temp
+                  MyDebug(dLog, "S%d Leader received suggested(%d) temp to %d", rf.me, server, temp)
 								} else {
+                  MyDebug(dLog, "S%d Leader received suggested(%d) next2 to %d", rf.me, server, reply.Next)
 									rf.nextIndex[server] = reply.Next
 								}
 							}
@@ -625,57 +631,58 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	}
 
 	// PrevLogIndex may be 0
-	if args.PrevLogIndex == 0 {
-		MyDebug(dLog, "S%d Follower, delete log to zero", rf.me)
-		// Append any new entry not already in the log
-		rf.log = rf.log[0:0]
+	/* if args.PrevLogIndex == 0 {*/
+	/*MyDebug(dLog, "S%d Follower, delete log to zero", rf.me)*/
+	/*// Append any new entry not already in the log*/
+	/*rf.log = rf.log[0:0]*/
+	/*if args.Entries != nil {*/
+	/*rf.log = append(rf.log, args.Entries...)*/
+	/*MyDebug(dLog, "S%d Follower, new entry appended:%v", rf.me, rf.log)*/
+	/*}*/
+	/*rf.updateCommitIndex(args.LeaderCommit)*/
+	/*reply.Success = true*/
+	/*} else {*/
+	// Test if there are conflicts(same index but different terms)
+	if rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+		// Delete the existing entry and all that follow it.
+		t := rf.log[args.PrevLogIndex-1].Term
+		rf.log = rf.log[0 : args.PrevLogIndex-1]
+		MyDebug(dLog, "S%d Follower, conflicts detected, delete log, new log:%v", rf.me, rf.log)
+		// Should return directly
+		reply.Term = rf.currentTerm
+		reply.Next = rf.SuggestNext(t, args.PrevLogIndex-1)
+		reply.ConflictTerm = t
+		reply.Success = false
+	} else {
+		// There is a match
 		if args.Entries != nil {
-			rf.log = append(rf.log, args.Entries...)
-			MyDebug(dLog, "S%d Follower, new entry appended:%v", rf.me, rf.log)
+			// We must take care not to delete right logs, as this might be a stale request
+			for i := range args.Entries {
+				if len(rf.log) < args.PrevLogIndex+1+i {
+					// There are no entries after this one.
+					// We need to simply append the remaining entries
+					rf.log = append(rf.log, args.Entries[i:]...)
+          break
+				} else {
+					// Compare the log
+					if rf.log[args.PrevLogIndex+i].Term == args.Entries[i].Term {
+						continue
+					} else {
+						// Does not match...
+						// Delete from the unmatched point.
+						rf.log = rf.log[0 : args.PrevLogIndex+i]
+						rf.log = append(rf.log, args.Entries[i:]...)
+            break
+					}
+				}
+			}
+
+			MyDebug(dLog, "S%d Follower, match detected, new log appended:%v", rf.me, rf.log)
 		}
 		rf.updateCommitIndex(args.LeaderCommit)
 		reply.Success = true
-	} else {
-		// Test if there are conflicts(same index but different terms)
-		if rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
-			// Delete the existing entry and all that follow it.
-			t := rf.log[args.PrevLogIndex-1].Term
-			rf.log = rf.log[0 : args.PrevLogIndex-1]
-			MyDebug(dLog, "S%d Follower, conflicts detected, delete log, new log:%v", rf.me, rf.log)
-			// Should return directly
-			reply.Term = rf.currentTerm
-			reply.Next = rf.SuggestNext(t, args.PrevLogIndex-1)
-			reply.ConflictTerm = t
-			reply.Success = false
-		} else {
-			// There is a match
-			if args.Entries != nil {
-				// We must take care not to delete right logs, as it will cause overhead
-				// on the network
-				for i := range args.Entries {
-					if len(rf.log) < args.PrevLogIndex+1+i {
-						// There are no entries after this one.
-						// We need to simply append the remaining entries
-						rf.log = append(rf.log, args.Entries[i:]...)
-					} else {
-						// Compare the log
-						if rf.log[args.PrevLogIndex+i].Term == args.Entries[i].Term {
-							continue
-						} else {
-							// Does not match...
-							// Delete from the unmatched point.
-							rf.log = rf.log[0 : args.PrevLogIndex+i]
-							rf.log = append(rf.log, args.Entries[i:]...)
-						}
-					}
-				}
-
-				MyDebug(dLog, "S%d Follower, match detected, new log appended:%v", rf.me, rf.log)
-			}
-			rf.updateCommitIndex(args.LeaderCommit)
-			reply.Success = true
-		}
 	}
+	//}
 }
 
 // Test if t1, i1 is at least up to date compared to t2 i2
@@ -845,7 +852,7 @@ func (rf *Raft) sendCommandToCh(applyCh chan ApplyMsg) {
 
 	sentIndex := 0
 	for rf.killed() == false {
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 		MyDebug(dTrace, "S%d tries to acquire lock in Ch thread", rf.me)
 		rf.mu.Lock()
 
