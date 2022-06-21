@@ -124,7 +124,7 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-type LogEntires struct {
+type LogEntry struct {
 }
 
 //
@@ -144,7 +144,7 @@ type Raft struct {
 	// -1 indicates that not voted in this round.
 	votedFor int
 
-	log []LogEntires
+	log []LogEntry
 	// volatile states on all servers
 	commitIndex int
 	lastApplied int
@@ -158,106 +158,6 @@ type Raft struct {
 	lastReset  time.Time
 }
 
-// Invoke under lock
-func (rf *Raft) broadcastAE() {
-	if rf.state != Leader {
-		return
-	}
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		// otherwise, send messages
-		go func(server int, term int) {
-			// held the lock
-			args := AppendEntryArgs{
-				Term:     term,
-				LeaderId: rf.me,
-			}
-			reply := AppendEntryReply{}
-      MyDebug(dLeader, "S%d Leader sends HB to server %d in term %d", rf.me, server, term)
-			ok := rf.sendAppendEntry(server, &args, &reply)
-			if ok {
-				// handle the result
-				// Always check the term
-        MyDebug(dTrace, "S%d tries to acquire the lock in MHAE", rf.me)
-				rf.mu.Lock()
-        defer rf.mu.Unlock()
-        defer MyDebug(dTrace, "S%d release the lock in MHAE", rf.me)
-
-				if rf.checkTerm(reply.Term) {
-					return
-				}
-				if reply.Term != term {
-					// Stale information
-					return
-				}
-				// We always expect a success from peers in 2A
-			}
-		}(i, rf.currentTerm)
-	}
-}
-
-// Invoke this function should held the lock
-func (rf *Raft) broadcastRV() {
-	args := RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateId: rf.me,
-		// TODO: implement LastLogIndex and LastLogTerm
-	}
-
-	done := false
-	count := 1
-	var lock sync.Mutex
-
-	for i := 0; i < len(rf.peers); i++ {
-		if i == rf.me {
-			continue
-		}
-		// Send rpc to other servers
-		go func(server int) {
-			reply := RequestVoteReply{}
-			MyDebug(dTimer, "S%d sends request to S%d", rf.me, server)
-			ok := rf.sendRequestVote(server, &args, &reply)
-			MyDebug(dTimer, "S%d received a result from S%d", rf.me, server)
-			if ok {
-				// Check the term
-        MyDebug(dTrace, "S%d tries to acquire the lock in MHRV", rf.me)
-				rf.mu.Lock()
-				defer rf.mu.Unlock()
-        defer MyDebug(dTrace, "S%d release the lock in MHRV", rf.me)
-
-				lock.Lock()
-				defer lock.Unlock()
-
-				if rf.checkTerm(reply.Term) {
-					// We failed to become the leader
-					done = true
-					return
-				}
-				if done {
-					// We have already become the leader or failed
-					return
-				}
-				if reply.VoteGranted {
-					count += 1
-					MyDebug(dVote, "S%d Candidate, received vote from S%d in term %d, total count %d", rf.me, server, rf.currentTerm, count)
-					if count > len(rf.peers)/2 {
-						if rf.state == Candidate && rf.currentTerm == args.Term {
-							// This is a valid reply, we become as the leader
-							MyDebug(dLeader, "S%d Leader, has become leader in term %d", rf.me, rf.currentTerm)
-							rf.state = Leader
-							done = true
-							rf.leaderInitialize()
-						}
-					}
-				}
-			}
-		}(i)
-	}
-
-}
-
 // To invoke this function, lock should be held
 // If term gets updated(gets bigger), the votedFor will be updated
 func (rf *Raft) checkTerm(term int) bool {
@@ -267,9 +167,7 @@ func (rf *Raft) checkTerm(term int) bool {
 		if rf.state != Follower {
 			MyDebug(dTimer, "S%d sees a bigger term %d, revert to follower", rf.me, term)
 			rf.state = Follower
-      rf.lastReset = time.Now()
-			// This instruction causes problem
-			//rf.resetTimer <- 1
+			rf.lastReset = time.Now()
 		}
 		return true
 	}
@@ -289,8 +187,8 @@ func (rf *Raft) converToCandidate() {
 // Invoke this function should held the lock
 // Before return from this function, the lock should be held
 func (rf *Raft) leaderInitialize() {
-  rf.broadcastAE()
-  rf.lastReset = time.Now()
+	rf.broadcastAE()
+	rf.lastReset = time.Now()
 }
 
 // Let's say the leader sends the heartbeats at interval 120ms
@@ -374,142 +272,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 //
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-type AppendEntryArgs struct {
-	Term         int
-	LeaderId     int
-	PrevLogIndex int
-	PrevLogTerm  int
-
-	Entries      []LogEntires
-	LeaderCommit int
-}
-
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int
-	VoteGranted bool
-}
-
-type AppendEntryReply struct {
-	Term    int
-	Success bool
-}
-
-// AEhandler
-func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
-  MyDebug(dTrace, "S%d tries to acquire lock in AE handler", rf.me)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-  defer MyDebug(dTrace, "S%d release the lock in AE handler", rf.me)
-
-	rf.checkTerm(args.Term)
-	if args.Term < rf.currentTerm {
-		MyDebug(dTimer, "S%d received a stale appendEntires from old leader", rf.me)
-		reply.Success = false
-		reply.Term = rf.currentTerm
-		return
-	}
-	// If u are candidate, then after receiving messages from new leader, convert to follower
-	if rf.state == Candidate {
-		MyDebug(dTimer, "S%d Candidate, received AE, convert back to follower", rf.me)
-		rf.state = Follower
-		reply.Success = true
-		reply.Term = rf.currentTerm
-    rf.lastReset = time.Now()
-	} else {
-		reply.Success = true
-		reply.Term = rf.currentTerm
-    rf.lastReset = time.Now()
-		MyDebug(dTimer, "S%d Follower, received AE, reset timer", rf.me)
-	}
-
-}
-
-//
-// example RequestVote RPC handler.
-//
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
-  MyDebug(dTrace, "S%d tries to acquire lock in RV handler", rf.me)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-  defer MyDebug(dTrace, "S%d release the lock in RV handler", rf.me)
-
-	rf.checkTerm(args.Term)
-	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
-		MyDebug(dVote, "S%d reject vote request from S%d in term %d", rf.me, args.CandidateId, rf.currentTerm)
-		reply.VoteGranted = false
-		return
-	}
-
-	// TODO: compare logs
-
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		rf.votedFor = args.CandidateId
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = true
-		MyDebug(dVote, "S%d Follower votes for S%d in term %d", rf.me, args.CandidateId, rf.currentTerm)
-		// the resetTimer channel blocks here
-    rf.lastReset = time.Now()
-		return
-	}
-}
-
-//
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
-}
-func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
-	ok := rf.peers[server].Call("Raft.AppendEntry", args, reply)
-	return ok
-}
-
-//
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -563,27 +325,27 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
 		time.Sleep(SLEEP_INTERVAL * time.Millisecond)
-    MyDebug(dTrace, "S%d tries to acquire lock in main thread", rf.me)
+		MyDebug(dTrace, "S%d tries to acquire lock in main thread", rf.me)
 		rf.mu.Lock()
 		switch rf.state {
 		case Follower:
-      if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()){
+			if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()) {
 				MyDebug(dTimer, "S%d Follower, timesout become Candidate in term %d", rf.me, rf.currentTerm+1)
 				rf.converToCandidate()
 			}
 		case Candidate:
-      if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()){
+			if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()) {
 				MyDebug(dTimer, "S%d Candidate, timesout Candidate again in term %d", rf.me, rf.currentTerm+1)
 				rf.converToCandidate()
 			}
 		case Leader:
-      if time.Since(rf.lastReset).Milliseconds() > 120 {
-        rf.lastReset = time.Now()
+			if time.Since(rf.lastReset).Milliseconds() > 120 {
+				rf.lastReset = time.Now()
 				MyDebug(dTimer, "S%d Leader, sends heartbeats in term %d", rf.me, rf.currentTerm)
 				rf.broadcastAE()
 			}
 		}
-    MyDebug(dTrace, "S%d releases the lock in main thread", rf.me)
+		MyDebug(dTrace, "S%d releases the lock in main thread", rf.me)
 		rf.mu.Unlock()
 
 		// Your code here to check if a leader election should
@@ -591,24 +353,6 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 
 		// The sleep time should based on the identity of the server
-
-		/*   select {*/
-		/*case <-time.After(time.Duration(rf.getRandomValue()) * time.Millisecond):*/
-		/*rf.mu.Lock()*/
-		/*switch rf.state {*/
-		/*case Follower:*/
-		/*MyDebug(dTimer, "S%d Follower, timesout become Candidate in term %d", rf.me, rf.currentTerm+1)*/
-		/*rf.converToCandidate()*/
-		/*case Candidate:*/
-		/*MyDebug(dTimer, "S%d Candidate, timesout Candidate again in term %d", rf.me, rf.currentTerm+1)*/
-		/*rf.converToCandidate()*/
-		/*case Leader:*/
-		/*MyDebug(dTimer, "S%d Leader, sends heartbeats in term %d", rf.me, rf.currentTerm)*/
-		/*rf.broadcastAE()*/
-		/*}*/
-		/*rf.mu.Unlock()*/
-		/*case <-rf.resetTimer:*/
-		/*}*/
 	}
 }
 
@@ -645,7 +389,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = nil
 	rf.matchIndex = nil
 	// Use append to add new entries into the log
-	rf.log = make([]LogEntires, 0)
+	rf.log = make([]LogEntry, 0)
 	rf.state = Follower
 
 	rf.resetTimer = make(chan int)
