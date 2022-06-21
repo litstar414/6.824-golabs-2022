@@ -52,14 +52,14 @@ func (rf *Raft) handleAEReply(server int, args *AppendEntryArgs, reply *AppendEn
 	}
 
 	if reply.Success {
-    MyDebug(dLeader, "S%d leader, received success from previous AE in term %d with entries:%v", rf.me, rf.currentTerm, args.Entries)
+		MyDebug(dLeader, "S%d leader, received success from previous AE in term %d", rf.me, rf.currentTerm)
 		// Update nextIndex and matchIndex
 		if prevLogIndex+1 == rf.nextIndex[server] {
 			// We can update
 			rf.nextIndex[server] = len(args.Entries) + 1 + prevLogIndex
 		}
-    MyDebug(dLeader, "S%d leader, update matchIndex(%d) with org1:%d, org2:%d", rf.me, server, rf.matchIndex[server], len(args.Entries) + prevLogIndex)
 		rf.matchIndex[server] = max(rf.matchIndex[server], len(args.Entries)+prevLogIndex)
+		MyDebug(dLeader, "S%d leader, update matchIndex(%d) to %d", rf.me, server, rf.matchIndex[server])
 	} else {
 		if reply.SuggestNext == -1 {
 			rf.nextIndex[server] -= 1
@@ -107,7 +107,7 @@ func (rf *Raft) broadcastAE() {
 		PrevLogTerm := rf.log[PrevLogIndex].Term
 		// Prepare Entries
 		Entries := rf.log[rf.nextIndex[i]:]
-    MyDebug(dLeader, "S%d Leader sends AE to server %d in term %d with entries:%v", rf.me, i, rf.currentTerm, Entries)
+		MyDebug(dLeader, "S%d Leader sends AE to server %d in term %d with entries:%v", rf.me, i, rf.currentTerm, Entries)
 		go rf.handleAE(i, rf.currentTerm, rf.me, PrevLogIndex, PrevLogTerm, Entries, rf.commitIndex)
 	}
 }
@@ -149,10 +149,11 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// Conflict not match term for prevLogIndex
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		// Conflict, delete the existing entry and all that follow it
-		rf.log = rf.log[0:args.PrevLogIndex]
+		t := rf.log[args.PrevLogIndex].Term
 		reply.Success = false
-		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.ConflictTerm = t
 		reply.SuggestNext = rf.findFirstIndexWithTerm(reply.ConflictTerm, args.PrevLogIndex)
+		rf.log = rf.log[0:args.PrevLogIndex]
 		return
 	}
 
@@ -162,7 +163,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		if len(rf.log)-1 < args.PrevLogIndex+i+1 {
 			// Append all the entries following it.
 			rf.log = append(rf.log, args.Entries[i:]...)
-      MyDebug(dLog, "S%d appends entries %v to its log", rf.me, args.Entries[i:])
+			MyDebug(dLog, "S%d appends entries %v to its log", rf.me, args.Entries[i:])
+			MyDebug(dLog, "S%d new log:%v", rf.me, rf.log)
 			break
 		}
 
@@ -174,11 +176,11 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			// Delete and append
 			rf.log = rf.log[0:index]
 			rf.log = append(rf.log, args.Entries[i:]...)
-      MyDebug(dLog, "S%d appends entries %v to its log", rf.me, args.Entries[i:])
+			MyDebug(dLog, "S%d appends entries %v to its log", rf.me, args.Entries[i:])
+			MyDebug(dLog, "S%d new log:%v", rf.me, rf.log)
 			break
 		}
 	}
-  MyDebug(dLog, "S%d new log:%v", rf.me, rf.log)
 	reply.Success = true
 
 	// Update commitIndex

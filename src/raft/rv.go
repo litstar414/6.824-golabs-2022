@@ -69,16 +69,35 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// TODO: compare logs
-
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		rf.votedFor = args.CandidateId
-		reply.Term = rf.currentTerm
-		reply.VoteGranted = true
-		MyDebug(dVote, "S%d Follower votes for S%d in term %d", rf.me, args.CandidateId, rf.currentTerm)
-		// the resetTimer channel blocks here
-		rf.lastReset = time.Now()
+		lastLogIndex := len(rf.log) - 1
+		lastLogTerm := rf.log[lastLogIndex].Term
+		if upToDate(args.LastLogTerm, args.LastLogIndex, lastLogTerm, lastLogIndex) {
+			rf.votedFor = args.CandidateId
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = true
+			rf.lastReset = time.Now()
+			return
+		} else {
+			reply.Term = rf.currentTerm
+			reply.VoteGranted = false
+		}
 		return
+	}
+}
+
+// Test if t1, i1 is at least up to date compared to t2 i2
+func upToDate(t1, i1, t2, i2 int) bool {
+	if t1 > t2 {
+		return true
+	} else if t1 < t2 {
+		return false
+	} else {
+		//t1 = t2
+		if i1 >= i2 {
+			return true
+		}
+		return false
 	}
 }
 
@@ -88,6 +107,8 @@ func (rf *Raft) broadcastRV() {
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
 		// TODO: implement LastLogIndex and LastLogTerm
+		LastLogIndex: len(rf.log) - 1,
+		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 
 	count := 1
@@ -99,9 +120,8 @@ func (rf *Raft) broadcastRV() {
 		// Send rpc to other servers
 		go func(server, term int) {
 			reply := RequestVoteReply{}
-			MyDebug(dTimer, "S%d sends request to S%d", rf.me, server)
+			MyDebug(dVote, "S%d sends request to S%d", rf.me, server)
 			ok := rf.sendRequestVote(server, &args, &reply)
-			MyDebug(dTimer, "S%d received a result from S%d", rf.me, server)
 			if ok {
 				// Check the term
 				MyDebug(dTrace, "S%d tries to acquire the lock in MHRV", rf.me)
@@ -123,7 +143,7 @@ func (rf *Raft) broadcastRV() {
 					MyDebug(dVote, "S%d Candidate, received vote from S%d in term %d, total count %d", rf.me, server, rf.currentTerm, count)
 					if count > len(rf.peers)/2 {
 						// This is a valid reply, we become as the leader
-						MyDebug(dLeader, "S%d Leader, has become leader in term %d", rf.me, rf.currentTerm)
+						MyDebug(dVote, "S%d Leader, has become leader in term %d", rf.me, rf.currentTerm)
 						rf.state = Leader
 						// When we update our term, other thread will not handle the stale request
 						rf.leaderInitialize()

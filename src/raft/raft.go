@@ -447,28 +447,24 @@ func (rf *Raft) updateLeaderCommit(term int) {
 		time.Sleep(10 * time.Millisecond)
 		MyDebug(dTrace, "S%d tries to acquire lock in updateLeaderCommit thread", rf.me)
 		rf.mu.Lock()
-		if rf.currentTerm!= term{
+		if rf.currentTerm != term {
 			MyDebug(dTrace, "S%d releases the lock in updateLeaderCommit thread", rf.me)
 			rf.mu.Unlock()
 			return
 		}
 		// Still leader, try to update leaderCommit
 		// We must select an entry that has the same term with us.
-    // commitIndex = 0
+		// commitIndex = 0
 		if rf.commitIndex >= rf.termStartIndex {
 			// Then try leaderCommit + 1
-      MyDebug(dLog, "S%d 's matchIndex:%v", rf.me, rf.matchIndex)
 			if rf.checkIfCommit(rf.commitIndex + 1) {
 				rf.commitIndex += 1
-		    MyDebug(dLeader, "S%d Leader updates its commitIndex to %d", rf.me, rf.commitIndex)
 			}
 		} else {
 			// Try termStartIndex
 			// What if termStartIndex not exist
-      MyDebug(dLog, "S%d 's matchIndex:%v", rf.me, rf.matchIndex)
 			if rf.checkIfCommit(rf.termStartIndex) {
 				rf.commitIndex = rf.termStartIndex
-		    MyDebug(dLeader, "S%d Leader updates its commitIndex to %d", rf.me, rf.commitIndex)
 			}
 		}
 		MyDebug(dTrace, "S%d releases the lock in updateLeaderCommit thread", rf.me)
