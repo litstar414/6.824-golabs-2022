@@ -125,6 +125,8 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
+	Command interface{}
+	Term    int
 }
 
 //
@@ -152,10 +154,16 @@ type Raft struct {
 	// leader states that are reinitialized after election.
 	nextIndex  []int
 	matchIndex []int
+	// Start index for this term
+	termStartIndex int
 
 	state      state
 	resetTimer chan int
 	lastReset  time.Time
+
+	messageQ    []ApplyMsg
+	messageLock sync.Mutex // Lock to protect shared access to this peer's state
+	cond        *sync.Cond
 }
 
 // To invoke this function, lock should be held
@@ -187,8 +195,17 @@ func (rf *Raft) converToCandidate() {
 // Invoke this function should held the lock
 // Before return from this function, the lock should be held
 func (rf *Raft) leaderInitialize() {
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.termStartIndex = len(rf.log)
+	for i := range rf.nextIndex {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = 0
+	}
+
 	rf.broadcastAE()
 	rf.lastReset = time.Now()
+	go rf.updateLeaderCommit(rf.currentTerm)
 }
 
 // Let's say the leader sends the heartbeats at interval 120ms
@@ -291,6 +308,28 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	term = rf.currentTerm
+	// Check leader
+	if rf.state != Leader {
+		isLeader = false
+		return index, term, isLeader
+	}
+
+	// Append entry to local log
+	c := LogEntry{
+		Command: command,
+		Term:    rf.currentTerm,
+	}
+
+	rf.log = append(rf.log, c)
+	index = len(rf.log) - 1
+
+	MyDebug(dLog, "S%d Leader new command received:%v in term %d", rf.me, command, rf.currentTerm)
+	// Start synchronize
+	rf.broadcastAE()
 
 	return index, term, isLeader
 }
@@ -356,6 +395,110 @@ func (rf *Raft) ticker() {
 	}
 }
 
+// No lock acquired on invoke
+func (rf *Raft) sendCommandToQ() {
+	sentIndex := 0
+	for rf.killed() == false {
+		time.Sleep(10 * time.Millisecond)
+		MyDebug(dTrace, "S%d tries to acquire lock in Ch thread", rf.me)
+		rf.mu.Lock()
+		commitIndex := rf.commitIndex
+		MyDebug(dTrace, "S%d tries to release the lock in Ch thread", rf.me)
+		rf.mu.Unlock()
+
+		if sentIndex < commitIndex {
+			rf.messageLock.Lock()
+			for sentIndex < commitIndex {
+				temp := ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[sentIndex+1].Command,
+					CommandIndex: sentIndex + 1,
+				}
+				sentIndex += 1
+				rf.messageQ = append(rf.messageQ, temp)
+			}
+			rf.messageLock.Unlock()
+			// We have new things to consume
+			rf.cond.Signal()
+		}
+	}
+}
+
+func (rf *Raft) applyFromQ(applyCh chan ApplyMsg) {
+	for rf.killed() == false {
+		// Wait for update
+		rf.messageLock.Lock()
+		rf.cond.Wait()
+		// Apply all the entries on messageQ
+		for i := range rf.messageQ {
+			MyDebug(dLog, "S%d apply command %v", rf.me, rf.messageQ[i].Command)
+			applyCh <- rf.messageQ[i]
+		}
+
+		// Now delete all the entries on the messageQ
+		rf.messageQ = rf.messageQ[0:0]
+		rf.messageLock.Unlock()
+	}
+}
+
+// Invoke under lock
+func (rf *Raft) updateLeaderCommit(term int) {
+	for rf.killed() == false {
+		time.Sleep(10 * time.Millisecond)
+		MyDebug(dTrace, "S%d tries to acquire lock in updateLeaderCommit thread", rf.me)
+		rf.mu.Lock()
+		if rf.currentTerm!= term{
+			MyDebug(dTrace, "S%d releases the lock in updateLeaderCommit thread", rf.me)
+			rf.mu.Unlock()
+			return
+		}
+		// Still leader, try to update leaderCommit
+		// We must select an entry that has the same term with us.
+    // commitIndex = 0
+		if rf.commitIndex >= rf.termStartIndex {
+			// Then try leaderCommit + 1
+      MyDebug(dLog, "S%d 's matchIndex:%v", rf.me, rf.matchIndex)
+			if rf.checkIfCommit(rf.commitIndex + 1) {
+				rf.commitIndex += 1
+		    MyDebug(dLeader, "S%d Leader updates its commitIndex to %d", rf.me, rf.commitIndex)
+			}
+		} else {
+			// Try termStartIndex
+			// What if termStartIndex not exist
+      MyDebug(dLog, "S%d 's matchIndex:%v", rf.me, rf.matchIndex)
+			if rf.checkIfCommit(rf.termStartIndex) {
+				rf.commitIndex = rf.termStartIndex
+		    MyDebug(dLeader, "S%d Leader updates its commitIndex to %d", rf.me, rf.commitIndex)
+			}
+		}
+		MyDebug(dTrace, "S%d releases the lock in updateLeaderCommit thread", rf.me)
+		rf.mu.Unlock()
+	}
+}
+
+// Check if index has committed or not.
+// Invoke under lock
+func (rf *Raft) checkIfCommit(index int) bool {
+	majority := len(rf.peers)/2 + 1
+	count := 0
+	for i := range rf.matchIndex {
+		if i != rf.me {
+			if rf.matchIndex[i] >= index {
+				count += 1
+			}
+		} else {
+			// self
+			if len(rf.log)-1 >= index {
+				count += 1
+			}
+		}
+	}
+	if count >= majority {
+		return true
+	}
+	return false
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -390,13 +533,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = nil
 	// Use append to add new entries into the log
 	rf.log = make([]LogEntry, 0)
+	rf.log = append(rf.log, LogEntry{
+		Command: -1,
+		Term:    0,
+	})
 	rf.state = Follower
 
 	rf.resetTimer = make(chan int)
 	rf.lastReset = time.Now()
+	rf.messageQ = make([]ApplyMsg, 0)
+	rf.cond = sync.NewCond(&rf.messageLock)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+	go rf.sendCommandToQ()
+	go rf.applyFromQ(applyCh)
 
 	return rf
 }

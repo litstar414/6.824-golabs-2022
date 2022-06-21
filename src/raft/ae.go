@@ -1,5 +1,9 @@
 package raft
 
+import (
+	"time"
+)
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -21,6 +25,9 @@ type AppendEntryArgs struct {
 type AppendEntryReply struct {
 	Term    int
 	Success bool
+
+	SuggestNext  int
+	ConflictTerm int
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *AppendEntryReply) bool {
@@ -30,13 +37,12 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 
 // Handle the reply for previous AE
 // NO LOCK
-func (rf *Raft) handleAEReply(reply *AppendEntryReply, term int) {
+func (rf *Raft) handleAEReply(server int, args *AppendEntryArgs, reply *AppendEntryReply, term int, prevLogIndex int) {
 	MyDebug(dTrace, "S%d tries to acquire the lock in MHAE", rf.me)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer MyDebug(dTrace, "S%d release the lock in MHAE", rf.me)
 
-	//TODO: implement
 	if rf.checkTerm(reply.Term) {
 		return
 	}
@@ -44,21 +50,43 @@ func (rf *Raft) handleAEReply(reply *AppendEntryReply, term int) {
 		// Stale information
 		return
 	}
+
+	if reply.Success {
+    MyDebug(dLeader, "S%d leader, received success from previous AE in term %d with entries:%v", rf.me, rf.currentTerm, args.Entries)
+		// Update nextIndex and matchIndex
+		if prevLogIndex+1 == rf.nextIndex[server] {
+			// We can update
+			rf.nextIndex[server] = len(args.Entries) + 1 + prevLogIndex
+		}
+    MyDebug(dLeader, "S%d leader, update matchIndex(%d) with org1:%d, org2:%d", rf.me, server, rf.matchIndex[server], len(args.Entries) + prevLogIndex)
+		rf.matchIndex[server] = max(rf.matchIndex[server], len(args.Entries)+prevLogIndex)
+	} else {
+		if reply.SuggestNext == -1 {
+			rf.nextIndex[server] -= 1
+		} else {
+			rf.nextIndex[server] = reply.SuggestNext
+		}
+	}
+
 }
 
 // This function will send AE and handle the reply
 // Do not assume lock on invoke
-func (rf *Raft) handleAE(server, term int) {
+func (rf *Raft) handleAE(server, term, LeaderId, PrevLogIndex, PrevLogTerm int,
+	Entries []LogEntry, LeaderCommit int) {
 	// held the lock
 	args := AppendEntryArgs{
-		Term:     term,
-		LeaderId: rf.me,
+		Term:         term,
+		LeaderId:     rf.me,
+		PrevLogIndex: PrevLogIndex,
+		PrevLogTerm:  PrevLogTerm,
+		Entries:      Entries,
+		LeaderCommit: LeaderCommit,
 	}
 	reply := AppendEntryReply{}
-	MyDebug(dLeader, "S%d Leader sends HB to server %d in term %d", rf.me, server, term)
 	ok := rf.sendAppendEntry(server, &args, &reply)
 	if ok {
-		rf.handleAEReply(&reply, term)
+		rf.handleAEReply(server, &args, &reply, term, PrevLogIndex)
 	}
 
 }
@@ -72,8 +100,15 @@ func (rf *Raft) broadcastAE() {
 		if i == rf.me {
 			continue
 		}
-		// otherwise, send messages
-		go rf.handleAE(i, rf.currentTerm)
+
+		//otherwise, send messages
+		//Prepare the arguments
+		PrevLogIndex := rf.nextIndex[i] - 1
+		PrevLogTerm := rf.log[PrevLogIndex].Term
+		// Prepare Entries
+		Entries := rf.log[rf.nextIndex[i]:]
+    MyDebug(dLeader, "S%d Leader sends AE to server %d in term %d with entries:%v", rf.me, i, rf.currentTerm, Entries)
+		go rf.handleAE(i, rf.currentTerm, rf.me, PrevLogIndex, PrevLogTerm, Entries, rf.commitIndex)
 	}
 }
 
@@ -85,6 +120,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	defer MyDebug(dTrace, "S%d release the lock in AE handler", rf.me)
 
 	rf.checkTerm(args.Term)
+	// Reply false if term < currentTerm
 	if args.Term < rf.currentTerm {
 		MyDebug(dTimer, "S%d received a stale appendEntires from old leader", rf.me)
 		reply.Success = false
@@ -95,15 +131,85 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if rf.state == Candidate {
 		MyDebug(dTimer, "S%d Candidate, received AE, convert back to follower", rf.me)
 		rf.state = Follower
-		reply.Success = true
-		reply.Term = rf.currentTerm
-		rf.lastReset = time.Now()
 	} else {
-		reply.Success = true
-		reply.Term = rf.currentTerm
-		rf.lastReset = time.Now()
 		MyDebug(dTimer, "S%d Follower, received AE, reset timer", rf.me)
 	}
 
+	reply.Term = rf.currentTerm
+	rf.lastReset = time.Now()
+	reply.SuggestNext = -1
+	reply.ConflictTerm = -1
+	// Reply false if log does not contain an entry at prevLogIndex
+	if len(rf.log)-1 < args.PrevLogIndex {
+		reply.Success = false
+		reply.SuggestNext = len(rf.log)
+		return
+	}
+
+	// Conflict not match term for prevLogIndex
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// Conflict, delete the existing entry and all that follow it
+		rf.log = rf.log[0:args.PrevLogIndex]
+		reply.Success = false
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.SuggestNext = rf.findFirstIndexWithTerm(reply.ConflictTerm, args.PrevLogIndex)
+		return
+	}
+
+	// No conflict on prevLogIndex
+	for i := range args.Entries {
+		// First test if my log has this entry or not
+		if len(rf.log)-1 < args.PrevLogIndex+i+1 {
+			// Append all the entries following it.
+			rf.log = append(rf.log, args.Entries[i:]...)
+      MyDebug(dLog, "S%d appends entries %v to its log", rf.me, args.Entries[i:])
+			break
+		}
+
+		// Compare the term
+		index := args.PrevLogIndex + i + 1
+		if rf.log[index].Term == args.Entries[i].Term {
+			continue
+		} else {
+			// Delete and append
+			rf.log = rf.log[0:index]
+			rf.log = append(rf.log, args.Entries[i:]...)
+      MyDebug(dLog, "S%d appends entries %v to its log", rf.me, args.Entries[i:])
+			break
+		}
+	}
+  MyDebug(dLog, "S%d new log:%v", rf.me, rf.log)
+	reply.Success = true
+
+	// Update commitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+	}
+	return
 }
 
+// Invoke with lock
+// Find the first log entry with term t
+// Or the last entry with term number t - 1
+func (rf *Raft) findFirstIndexWithTerm(t, startIndex int) int {
+	for ; startIndex > 0 && rf.log[startIndex].Term == t; startIndex-- {
+
+	}
+	return startIndex + 1
+}
+
+func min(a, b int) int {
+	if a <= b {
+		return a
+	}
+
+	return b
+}
+
+func max(a, b int) int {
+	if a >= b {
+		return a
+	}
+
+	return b
+}

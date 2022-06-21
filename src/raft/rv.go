@@ -1,7 +1,7 @@
 package raft
 
 import (
-  "time"
+	"time"
 )
 
 type RequestVoteArgs struct {
@@ -11,8 +11,6 @@ type RequestVoteArgs struct {
 	LastLogIndex int
 	LastLogTerm  int
 }
-
-
 type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int
@@ -52,7 +50,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
-
 
 //
 // example RequestVote RPC handler.
@@ -121,7 +118,7 @@ func (rf *Raft) broadcastRV() {
 				if term != rf.currentTerm {
 					return
 				}
-				if reply.VoteGranted {
+				if reply.VoteGranted && rf.state != Leader {
 					count += 1
 					MyDebug(dVote, "S%d Candidate, received vote from S%d in term %d, total count %d", rf.me, server, rf.currentTerm, count)
 					if count > len(rf.peers)/2 {
