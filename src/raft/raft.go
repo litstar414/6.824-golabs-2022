@@ -124,13 +124,7 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-// Each log entry stores a state machine command along with the
-// term number when the entry was received by the leader
-// Each log also has an integer index identifying its position in the log.
-type LogEntry struct {
-	Command interface{}
-	Index   int
-	Term    int
+type LogEntires struct {
 }
 
 //
@@ -150,21 +144,18 @@ type Raft struct {
 	// -1 indicates that not voted in this round.
 	votedFor int
 
-	log []LogEntry
+	log []LogEntires
 	// volatile states on all servers
 	commitIndex int
 	lastApplied int
 
 	// leader states that are reinitialized after election.
-	nextIndex []int
-	// If matchIndex[i] >= 1, then log from [1, matchIndex[i]] are committed
-	// Otherwise, no log are committed
+	nextIndex  []int
 	matchIndex []int
 
-	state     state
-	lastReset time.Time
-
-	termStartIndex int
+	state      state
+	resetTimer chan int
+	lastReset  time.Time
 }
 
 // Invoke under lock
@@ -176,58 +167,23 @@ func (rf *Raft) broadcastAE() {
 		if i == rf.me {
 			continue
 		}
-		// We should prepare all the arguments here.
-		var entries []LogEntry
-		prevLogIndex := 0
-		prevLogTerm := 0
-		leaderCommit := -1
-
-		// When we delete elements in the log, we must also change its length.
-		// What if nextIndex[i] is 0?
-		if rf.nextIndex[i] > len(rf.log) {
-			// we dont have anything new to send out.
-			entries = nil
-		} else {
-			// Generate a slice which contains the log that needs to be appended
-			// XXX: This may be dangerous as we are using slice and the slice may change
-			entries = rf.log[rf.nextIndex[i]-1:]
-		}
-
-		// Setup prevLogIndex and prevLogTerm
-		// If we only have one element, then set them to 0
-		if rf.nextIndex[i] != 1 {
-			prevLogIndex = rf.log[rf.nextIndex[i]-2].Index
-			prevLogTerm = rf.log[rf.nextIndex[i]-2].Term
-		}
-
-		leaderCommit = rf.commitIndex
-
-		// Next step
-		go func(server int, term int, entries []LogEntry, prevLogIndex, prevLogTerm, leaderCommit int) {
+		// otherwise, send messages
+		go func(server int, term int) {
 			// held the lock
 			args := AppendEntryArgs{
-				Term:         term,
-				LeaderId:     rf.me,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
-				LeaderCommit: leaderCommit,
+				Term:     term,
+				LeaderId: rf.me,
 			}
 			reply := AppendEntryReply{}
-			if args.Entries == nil {
-
-				MyDebug(dLeader, "S%d Leader sends HB to server %d in term %d", rf.me, server, term)
-			} else {
-				MyDebug(dLog, "S%d Leader sends AE to server %d in term %d %v", rf.me, server, term, entries)
-			}
+      MyDebug(dLeader, "S%d Leader sends HB to server %d in term %d", rf.me, server, term)
 			ok := rf.sendAppendEntry(server, &args, &reply)
 			if ok {
 				// handle the result
 				// Always check the term
-				MyDebug(dTrace, "S%d tries to acquire the lock in MHAE", rf.me)
+        MyDebug(dTrace, "S%d tries to acquire the lock in MHAE", rf.me)
 				rf.mu.Lock()
-				defer rf.mu.Unlock()
-				defer MyDebug(dTrace, "S%d release the lock in MHAE", rf.me)
+        defer rf.mu.Unlock()
+        defer MyDebug(dTrace, "S%d release the lock in MHAE", rf.me)
 
 				if rf.checkTerm(reply.Term) {
 					return
@@ -236,54 +192,9 @@ func (rf *Raft) broadcastAE() {
 					// Stale information
 					return
 				}
-				if reply.Success {
-					// If successful: update nextIndex and matchIndex for follower
-					// However, we need to take care if this message is a heartbeat message
-					MyDebug(dLog, "S%d Leader received success from previous AE for server %d in term %d", rf.me, server, term)
-					if args.Entries == nil {
-						// This success simply means that prevLogIndex and prevLogTerm matches.
-						rf.matchIndex[server] = max(rf.matchIndex[server], args.PrevLogIndex)
-						// Don't update nextIndex
-					} else {
-						//rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-						// Match index simply won't go back in the same term
-						rf.matchIndex[server] = max(rf.matchIndex[server], args.PrevLogIndex+len(args.Entries))
-						// XXX: Update only if we does not observe a change in the nextIndex[server]
-						if rf.nextIndex[server] == args.PrevLogIndex+1 {
-							// We do not want to go back
-							rf.nextIndex[server] = args.PrevLogIndex + 1 + len(args.Entries)
-						}
-					}
-				} else {
-					// Decrement nextIndex and retry
-					// Ensure we does not see any changes in the nextIndex
-					if rf.nextIndex[server] == args.PrevLogIndex+1 {
-            MyDebug(dLog, "S%d Leader received suggested(%d) Term:%d Next:%d", rf.me, server, reply.ConflictTerm, reply.Next)
-						if reply.Next == -1 {
-							rf.nextIndex[server] -= 1
-            MyDebug(dLog, "S%d Leader received suggested(%d) -1 to %d", rf.me, server, rf.nextIndex[server])
-						} else {
-							if reply.ConflictTerm == -1 {
-								rf.nextIndex[server] = reply.Next
-                MyDebug(dLog, "S%d Leader received suggested(%d) Next to %d", rf.me, server, rf.nextIndex[server])
-							} else {
-								// Do we have term in our log?
-								temp := args.PrevLogIndex
-								for ; rf.log[temp-1].Term > reply.ConflictTerm && temp > 1; temp-- {
-								}
-								if rf.log[temp-1].Term == reply.ConflictTerm {
-									rf.nextIndex[server] = temp
-                  MyDebug(dLog, "S%d Leader received suggested(%d) temp to %d", rf.me, server, temp)
-								} else {
-                  MyDebug(dLog, "S%d Leader received suggested(%d) next2 to %d", rf.me, server, reply.Next)
-									rf.nextIndex[server] = reply.Next
-								}
-							}
-						}
-					}
-				}
+				// We always expect a success from peers in 2A
 			}
-		}(i, rf.currentTerm, entries, prevLogIndex, prevLogTerm, leaderCommit)
+		}(i, rf.currentTerm)
 	}
 }
 
@@ -292,13 +203,7 @@ func (rf *Raft) broadcastRV() {
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
-		// Might be -1
-		LastLogIndex: len(rf.log),
-	}
-	if args.LastLogIndex == 0 {
-		args.LastLogTerm = 0
-	} else {
-		args.LastLogTerm = rf.log[args.LastLogIndex-1].Term
+		// TODO: implement LastLogIndex and LastLogTerm
 	}
 
 	done := false
@@ -312,15 +217,15 @@ func (rf *Raft) broadcastRV() {
 		// Send rpc to other servers
 		go func(server int) {
 			reply := RequestVoteReply{}
-			MyDebug(dTimer, "S%d sends request to S%d with arg:%v", rf.me, server, args)
+			MyDebug(dTimer, "S%d sends request to S%d", rf.me, server)
 			ok := rf.sendRequestVote(server, &args, &reply)
 			MyDebug(dTimer, "S%d received a result from S%d", rf.me, server)
 			if ok {
 				// Check the term
-				MyDebug(dTrace, "S%d tries to acquire the lock in MHRV", rf.me)
+        MyDebug(dTrace, "S%d tries to acquire the lock in MHRV", rf.me)
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				defer MyDebug(dTrace, "S%d release the lock in MHRV", rf.me)
+        defer MyDebug(dTrace, "S%d release the lock in MHRV", rf.me)
 
 				lock.Lock()
 				defer lock.Unlock()
@@ -362,7 +267,7 @@ func (rf *Raft) checkTerm(term int) bool {
 		if rf.state != Follower {
 			MyDebug(dTimer, "S%d sees a bigger term %d, revert to follower", rf.me, term)
 			rf.state = Follower
-			rf.lastReset = time.Now()
+      rf.lastReset = time.Now()
 			// This instruction causes problem
 			//rf.resetTimer <- 1
 		}
@@ -381,74 +286,11 @@ func (rf *Raft) converToCandidate() {
 	rf.broadcastRV()
 }
 
-// Check if index has committed or not.
-// Invoke under lock
-func (rf *Raft) checkIfCommit(index int) bool {
-	majority := len(rf.peers)/2 + 1
-	count := 0
-	for i := range rf.matchIndex {
-		if i != rf.me {
-			if rf.matchIndex[i] >= index {
-				count += 1
-			}
-		} else {
-			// self
-			if len(rf.log) >= index {
-				count += 1
-			}
-		}
-	}
-	if count >= majority {
-		return true
-	}
-	return false
-}
-
-func (rf *Raft) updateLeaderCommit() {
-	for rf.killed() == false {
-		time.Sleep(30 * time.Millisecond)
-		MyDebug(dTrace, "S%d tries to acquire lock in updateLeaderCommit thread", rf.me)
-		rf.mu.Lock()
-		if rf.state != Leader {
-			MyDebug(dTrace, "S%d releases the lock in main thread", rf.me)
-			rf.mu.Unlock()
-			return
-		}
-		// Still leader, try to update leaderCommit
-		// We must select an entry that has the same term with us.
-		if rf.commitIndex >= rf.termStartIndex {
-			// Then try leaderCommit + 1
-			if rf.checkIfCommit(rf.commitIndex + 1) {
-				rf.commitIndex += 1
-			}
-		} else {
-			// Try termStartIndex
-			if rf.checkIfCommit(rf.termStartIndex) {
-				rf.commitIndex = rf.termStartIndex
-			}
-		}
-		MyDebug(dLeader, "S%d Leader updates its commitIndex to %d", rf.me, rf.commitIndex)
-		rf.mu.Unlock()
-	}
-}
-
 // Invoke this function should held the lock
 // Before return from this function, the lock should be held
 func (rf *Raft) leaderInitialize() {
-	// re-initialize nextIndex and matchIndex
-	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matchIndex = make([]int, len(rf.peers))
-	rf.termStartIndex = len(rf.log) + 1
-	MyDebug(dLog, "S%d Leader initialize, with log:%v", rf.me, rf.log)
-	for i := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.log) + 1
-		rf.matchIndex[i] = 0
-	}
-	rf.broadcastAE()
-	rf.lastReset = time.Now()
-
-	// Spawn a new go routine to update leaderCommit
-	go rf.updateLeaderCommit()
+  rf.broadcastAE()
+  rf.lastReset = time.Now()
 }
 
 // Let's say the leader sends the heartbeats at interval 120ms
@@ -549,7 +391,7 @@ type AppendEntryArgs struct {
 	PrevLogIndex int
 	PrevLogTerm  int
 
-	Entries      []LogEntry
+	Entries      []LogEntires
 	LeaderCommit int
 }
 
@@ -566,147 +408,47 @@ type RequestVoteReply struct {
 type AppendEntryReply struct {
 	Term    int
 	Success bool
-	// Default to -1 which indicates that the leader should handler it by itself
-	Next int
-	// Default to -1
-	ConflictTerm int
-}
-
-// Invoke under lock
-func (rf *Raft) updateCommitIndex(leaderCommit int) {
-	if leaderCommit > rf.commitIndex {
-		rf.commitIndex = min(leaderCommit, len(rf.log)+1)
-		MyDebug(dLog, "S%d update commitIndex to %d with leaderCommit:%d", rf.me, rf.commitIndex, leaderCommit)
-	}
-}
-
-// Invoke under lock
-func (rf *Raft) SuggestNext(term, index int) int {
-	for index > 1 && rf.log[index-1].Term >= term {
-		index -= 1
-	}
-	return index
 }
 
 // AEhandler
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
-	MyDebug(dTrace, "S%d tries to acquire lock in AE handler", rf.me)
+  MyDebug(dTrace, "S%d tries to acquire lock in AE handler", rf.me)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer MyDebug(dTrace, "S%d release the lock in AE handler", rf.me)
+  defer MyDebug(dTrace, "S%d release the lock in AE handler", rf.me)
 
 	rf.checkTerm(args.Term)
 	if args.Term < rf.currentTerm {
 		MyDebug(dTimer, "S%d received a stale appendEntires from old leader", rf.me)
 		reply.Success = false
 		reply.Term = rf.currentTerm
-		reply.Next = -1
-		reply.ConflictTerm = -1
 		return
 	}
 	// If u are candidate, then after receiving messages from new leader, convert to follower
 	if rf.state == Candidate {
 		MyDebug(dTimer, "S%d Candidate, received AE, convert back to follower", rf.me)
 		rf.state = Follower
+		reply.Success = true
+		reply.Term = rf.currentTerm
+    rf.lastReset = time.Now()
 	} else {
+		reply.Success = true
+		reply.Term = rf.currentTerm
+    rf.lastReset = time.Now()
 		MyDebug(dTimer, "S%d Follower, received AE, reset timer", rf.me)
 	}
 
-	// Reset the timer as we now receive a valid AE(has term not smaller than us)
-	rf.lastReset = time.Now()
-	reply.Term = rf.currentTerm
-	reply.Next = -1
-	reply.ConflictTerm = -1
-
-	// Reply false if log doesn't contain an entry at prevLogIndex whose
-	// term matches prevLogTerm
-	MyDebug(dLog2, "S%d Follower's log:%v", rf.me, rf.log)
-	if args.PrevLogIndex != 0 {
-		if len(rf.log) < args.PrevLogIndex {
-			MyDebug(dLog, "S%d Follower, does not contain an entry at index %d", rf.me, args.PrevLogIndex)
-			reply.Success = false
-			reply.Next = len(rf.log)
-			return
-		}
-	}
-
-	// PrevLogIndex may be 0
-	/* if args.PrevLogIndex == 0 {*/
-	/*MyDebug(dLog, "S%d Follower, delete log to zero", rf.me)*/
-	/*// Append any new entry not already in the log*/
-	/*rf.log = rf.log[0:0]*/
-	/*if args.Entries != nil {*/
-	/*rf.log = append(rf.log, args.Entries...)*/
-	/*MyDebug(dLog, "S%d Follower, new entry appended:%v", rf.me, rf.log)*/
-	/*}*/
-	/*rf.updateCommitIndex(args.LeaderCommit)*/
-	/*reply.Success = true*/
-	/*} else {*/
-	// Test if there are conflicts(same index but different terms)
-	if rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
-		// Delete the existing entry and all that follow it.
-		t := rf.log[args.PrevLogIndex-1].Term
-		rf.log = rf.log[0 : args.PrevLogIndex-1]
-		MyDebug(dLog, "S%d Follower, conflicts detected, delete log, new log:%v", rf.me, rf.log)
-		// Should return directly
-		reply.Term = rf.currentTerm
-		reply.Next = rf.SuggestNext(t, args.PrevLogIndex-1)
-		reply.ConflictTerm = t
-		reply.Success = false
-	} else {
-		// There is a match
-		if args.Entries != nil {
-			// We must take care not to delete right logs, as this might be a stale request
-			for i := range args.Entries {
-				if len(rf.log) < args.PrevLogIndex+1+i {
-					// There are no entries after this one.
-					// We need to simply append the remaining entries
-					rf.log = append(rf.log, args.Entries[i:]...)
-          break
-				} else {
-					// Compare the log
-					if rf.log[args.PrevLogIndex+i].Term == args.Entries[i].Term {
-						continue
-					} else {
-						// Does not match...
-						// Delete from the unmatched point.
-						rf.log = rf.log[0 : args.PrevLogIndex+i]
-						rf.log = append(rf.log, args.Entries[i:]...)
-            break
-					}
-				}
-			}
-
-			MyDebug(dLog, "S%d Follower, match detected, new log appended:%v", rf.me, rf.log)
-		}
-		rf.updateCommitIndex(args.LeaderCommit)
-		reply.Success = true
-	}
-	//}
 }
 
-// Test if t1, i1 is at least up to date compared to t2 i2
-func upToDate(t1, i1, t2, i2 int) bool {
-	if t1 > t2 {
-		return true
-	} else if t1 < t2 {
-		return false
-	} else {
-		//t1 = t2
-		if i1 >= i2 {
-			return true
-		}
-		return false
-	}
-}
-
-//REhandler
+//
+// example RequestVote RPC handler.
+//
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	MyDebug(dTrace, "S%d tries to acquire lock in RV handler", rf.me)
+  MyDebug(dTrace, "S%d tries to acquire lock in RV handler", rf.me)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer MyDebug(dTrace, "S%d release the lock in RV handler", rf.me)
+  defer MyDebug(dTrace, "S%d release the lock in RV handler", rf.me)
 
 	rf.checkTerm(args.Term)
 	if args.Term < rf.currentTerm {
@@ -716,29 +458,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	// TODO: compare logs
+
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		//Check if log is at least up-to-date as the candidate
-		MyDebug(dLog, "S%d Follower my log:%v", rf.me, rf.log)
-		lastLogIndex := len(rf.log)
-		lastLogTerm := 0
-		if lastLogIndex != 0 {
-			lastLogTerm = rf.log[lastLogIndex-1].Term
-		}
-		MyDebug(dLog, "S%d log comparsion, my lastLogTerm:%d, lastLogIndex:%d", rf.me, lastLogTerm, lastLogIndex)
-		if upToDate(args.LastLogTerm, args.LastLogIndex, lastLogTerm, lastLogIndex) {
-			// Vote
-			rf.votedFor = args.CandidateId
-			reply.Term = rf.currentTerm
-			reply.VoteGranted = true
-			MyDebug(dVote, "S%d Follower votes for S%d in term %d", rf.me, args.CandidateId, rf.currentTerm)
-			rf.lastReset = time.Now()
-			return
-		} else {
-			// Not vote
-			MyDebug(dVote, "S%d Follower reject vote for S%d in term %d, not updated log", rf.me, args.CandidateId, rf.currentTerm)
-			reply.Term = rf.currentTerm
-			reply.VoteGranted = false
-		}
+		rf.votedFor = args.CandidateId
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = true
+		MyDebug(dVote, "S%d Follower votes for S%d in term %d", rf.me, args.CandidateId, rf.currentTerm)
+		// the resetTimer channel blocks here
+    rf.lastReset = time.Now()
+		return
 	}
 }
 
@@ -795,34 +524,13 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	index := -1
+	term := -1
+	isLeader := true
+
 	// Your code here (2B).
-	MyDebug(dTrace, "S%d tries to acquire the lock in Start", rf.me)
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	defer MyDebug(dTrace, "S%d release the lock in Start", rf.me)
 
-	// First check if me is the leader or not
-	if rf.state != Leader {
-		// The index and term only has meaning when it's the leader
-		return -1, -1, false
-	}
-	MyDebug(dLog, "S%d receives new command in Start", rf.me)
-	// Generate the LogEntry
-	log := LogEntry{
-		Command: command,
-		Term:    rf.currentTerm,
-		Index:   len(rf.log) + 1,
-	}
-
-	// Append to its own log
-	rf.log = append(rf.log, log)
-
-	// Reset the timer for leader as we are about to send messages
-	rf.lastReset = time.Now()
-	rf.broadcastAE()
-
-	// Return immediately from the function, don't wait for results
-	return len(rf.log), rf.currentTerm, true
+	return index, term, isLeader
 }
 
 //
@@ -848,65 +556,59 @@ func (rf *Raft) killed() bool {
 
 const SLEEP_INTERVAL = 5
 
-func (rf *Raft) sendCommandToCh(applyCh chan ApplyMsg) {
-
-	sentIndex := 0
-	for rf.killed() == false {
-		time.Sleep(10 * time.Millisecond)
-		MyDebug(dTrace, "S%d tries to acquire lock in Ch thread", rf.me)
-		rf.mu.Lock()
-
-		for sentIndex < rf.commitIndex {
-			temp := ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[sentIndex].Command,
-				CommandIndex: sentIndex + 1,
-			}
-			sentIndex += 1
-			applyCh <- temp
-			MyDebug(dLog, "S%d sends message to the applyCh %v", rf.me, temp.Command)
-		}
-
-		rf.mu.Unlock()
-		MyDebug(dTrace, "S%d tries to release the lock in Ch thread", rf.me)
-	}
-}
-
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 // If we are the leader, we can simply ignore this function, otherwise we do other things.
 func (rf *Raft) ticker() {
-	// Your code here to check if a leader election should
-	// be started and to randomize sleeping time using
-	// time.Sleep().
-
-	// The sleep time should based on the identity of the server
-
 	for rf.killed() == false {
 
 		time.Sleep(SLEEP_INTERVAL * time.Millisecond)
-		MyDebug(dTrace, "S%d tries to acquire lock in main thread", rf.me)
+    MyDebug(dTrace, "S%d tries to acquire lock in main thread", rf.me)
 		rf.mu.Lock()
 		switch rf.state {
 		case Follower:
-			if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()) {
+      if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()){
 				MyDebug(dTimer, "S%d Follower, timesout become Candidate in term %d", rf.me, rf.currentTerm+1)
 				rf.converToCandidate()
 			}
 		case Candidate:
-			if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()) {
+      if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()){
 				MyDebug(dTimer, "S%d Candidate, timesout Candidate again in term %d", rf.me, rf.currentTerm+1)
 				rf.converToCandidate()
 			}
 		case Leader:
-			if time.Since(rf.lastReset).Milliseconds() > 120 {
-				rf.lastReset = time.Now()
+      if time.Since(rf.lastReset).Milliseconds() > 120 {
+        rf.lastReset = time.Now()
 				MyDebug(dTimer, "S%d Leader, sends heartbeats in term %d", rf.me, rf.currentTerm)
 				rf.broadcastAE()
 			}
 		}
-		MyDebug(dTrace, "S%d releases the lock in main thread", rf.me)
+    MyDebug(dTrace, "S%d releases the lock in main thread", rf.me)
 		rf.mu.Unlock()
+
+		// Your code here to check if a leader election should
+		// be started and to randomize sleeping time using
+		// time.Sleep().
+
+		// The sleep time should based on the identity of the server
+
+		/*   select {*/
+		/*case <-time.After(time.Duration(rf.getRandomValue()) * time.Millisecond):*/
+		/*rf.mu.Lock()*/
+		/*switch rf.state {*/
+		/*case Follower:*/
+		/*MyDebug(dTimer, "S%d Follower, timesout become Candidate in term %d", rf.me, rf.currentTerm+1)*/
+		/*rf.converToCandidate()*/
+		/*case Candidate:*/
+		/*MyDebug(dTimer, "S%d Candidate, timesout Candidate again in term %d", rf.me, rf.currentTerm+1)*/
+		/*rf.converToCandidate()*/
+		/*case Leader:*/
+		/*MyDebug(dTimer, "S%d Leader, sends heartbeats in term %d", rf.me, rf.currentTerm)*/
+		/*rf.broadcastAE()*/
+		/*}*/
+		/*rf.mu.Unlock()*/
+		/*case <-rf.resetTimer:*/
+		/*}*/
 	}
 }
 
@@ -943,30 +645,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = nil
 	rf.matchIndex = nil
 	// Use append to add new entries into the log
-	rf.log = make([]LogEntry, 0)
+	rf.log = make([]LogEntires, 0)
 	rf.state = Follower
 
+	rf.resetTimer = make(chan int)
 	rf.lastReset = time.Now()
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.sendCommandToCh(applyCh)
 
 	return rf
-}
-
-func min(a, b int) int {
-	if a <= b {
-		return a
-	}
-
-	return b
-}
-
-func max(a, b int) int {
-	if a >= b {
-		return a
-	}
-
-	return b
 }
