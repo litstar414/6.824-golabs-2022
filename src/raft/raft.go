@@ -19,7 +19,9 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -29,6 +31,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -157,9 +160,8 @@ type Raft struct {
 	// Start index for this term
 	termStartIndex int
 
-	state      state
-	resetTimer chan int
-	lastReset  time.Time
+	state     state
+	lastReset time.Time
 
 	messageQ    []ApplyMsg
 	messageLock sync.Mutex // Lock to protect shared access to this peer's state
@@ -235,37 +237,65 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
+// Invoke under lock
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	for i := range rf.log {
+		if i == 0 {
+			continue
+		}
+		e.Encode(rf.log[i])
+	}
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+	MyDebug(dPersist, "S%d stores state->currentTerm:%d votedFor:%d log:%v",
+		rf.me, rf.currentTerm, rf.votedFor, rf.log)
+
 }
 
 //
 // restore previously persisted state.
 //
+// We should probably run this code after initialization
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+		MyDebug(dPersist, "S%d no previous information found from persist", rf.me)
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil {
+		// error occurs
+		MyDebug(dPersist, "S%d reads from persister failed", rf.me)
+	} else {
+		rf.votedFor = votedFor
+		rf.currentTerm = currentTerm
+	}
+
+	// Tries to decode the log from the decoder
+	var entry LogEntry
+	var e error
+	for e = d.Decode(&entry); e == nil; e = d.Decode(&entry) {
+		// No error occurs
+		rf.log = append(rf.log, entry)
+	}
+
+	// Error occurs
+	if e == io.EOF {
+		MyDebug(dPersist, "S%d restore finished with state currentTerm:%d votedFor:%d rf.log:%v",
+			rf.me, rf.currentTerm, rf.votedFor, rf.log)
+	} else {
+		// Error occurs
+		MyDebug(dPersist, "S%d reads from persister failed with error:%v", rf.me, e)
+	}
 }
 
 //
@@ -515,9 +545,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-
 	rf.currentTerm = 0
 	rf.votedFor = -1
 
@@ -535,10 +562,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	})
 	rf.state = Follower
 
-	rf.resetTimer = make(chan int)
 	rf.lastReset = time.Now()
 	rf.messageQ = make([]ApplyMsg, 0)
 	rf.cond = sync.NewCond(&rf.messageLock)
+
+	// 2C reads from persist storage if there are any
+	// initialize from state persisted before a crash
+	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
