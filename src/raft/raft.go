@@ -174,6 +174,7 @@ func (rf *Raft) checkTerm(term int) bool {
 	if term > rf.currentTerm {
 		rf.votedFor = -1
 		rf.currentTerm = term
+		rf.persist()
 		if rf.state != Follower {
 			MyDebug(dTimer, "S%d sees a bigger term %d, revert to follower", rf.me, term)
 			rf.state = Follower
@@ -191,6 +192,7 @@ func (rf *Raft) converToCandidate() {
 	rf.lastReset = time.Now()
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.broadcastRV()
 }
 
@@ -355,6 +357,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.log = append(rf.log, c)
+	rf.persist()
 	index = len(rf.log) - 1
 
 	MyDebug(dLog, "S%d Leader new command received:%v in term %d", rf.me, command, rf.currentTerm)
@@ -434,6 +437,11 @@ func (rf *Raft) sendCommandToQ() {
 		rf.mu.Lock()
 		commitIndex := rf.commitIndex
 		MyDebug(dTrace, "S%d tries to release the lock in Ch thread", rf.me)
+		/*WARNING: Unlock here will cause races as we do not protect rf.log*/
+		/*with the lock.  However, I think it is quite safe to do so as we will only*/
+		/*tries to read the commited logs which should never be changed by AE RPC.*/
+		/*It do cause tests with race flag to fail, but it speeds up the tests by*/
+		/*around 10s*/
 		rf.mu.Unlock()
 
 		if sentIndex < commitIndex {

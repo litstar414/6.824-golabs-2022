@@ -154,6 +154,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.ConflictTerm = t
 		reply.SuggestNext = rf.findFirstIndexWithTerm(reply.ConflictTerm, args.PrevLogIndex)
 		rf.log = rf.log[0:args.PrevLogIndex]
+		rf.persist()
 		return
 	}
 
@@ -165,6 +166,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			rf.log = append(rf.log, args.Entries[i:]...)
 			MyDebug(dLog, "S%d appends entries %v to its log", rf.me, args.Entries[i:])
 			MyDebug(dLog, "S%d new log:%v", rf.me, rf.log)
+			rf.persist()
 			break
 		}
 
@@ -176,6 +178,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 			// Delete and append
 			rf.log = rf.log[0:index]
 			rf.log = append(rf.log, args.Entries[i:]...)
+			rf.persist()
 			MyDebug(dLog, "S%d appends entries %v to its log", rf.me, args.Entries[i:])
 			MyDebug(dLog, "S%d new log:%v", rf.me, rf.log)
 			break
