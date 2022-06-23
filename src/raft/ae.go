@@ -104,9 +104,21 @@ func (rf *Raft) broadcastAE() {
 		//otherwise, send messages
 		//Prepare the arguments
 		PrevLogIndex := rf.nextIndex[i] - 1
-		PrevLogTerm := rf.log[PrevLogIndex].Term
-		// Prepare Entries
-		Entries := rf.log[rf.nextIndex[i]:]
+		if PrevLogIndex < rf.lastIncludedIndex {
+			// TODO: PrevLogIndex may in the snapshot, in that case, we should send the snapshot
+			// TODO: send snapshot
+			MyDebug(dSnap, "S%d sends snapshot for server %d with PrevLogIndex:%v lastIncludedIndex:%v",
+				rf.me, PrevLogIndex, rf.lastIncludedIndex)
+			continue
+		}
+		var PrevLogTerm int
+		if PrevLogIndex == rf.lastIncludedIndex {
+			PrevLogTerm = rf.lastIncludedTerm
+		} else {
+			PrevLogTerm = rf.log[PrevLogIndex-rf.lastIncludedIndex].Term
+		}
+		// Prepare Entries, as we may cut this while sending the rpc, create a new one
+		Entries := append([]LogEntry{}, rf.log[rf.nextIndex[i]-rf.lastIncludedIndex:]...)
 		MyDebug(dLeader, "S%d Leader sends AE to server %d in term %d with entries:%v", rf.me, i, rf.currentTerm, Entries)
 		go rf.handleAE(i, rf.currentTerm, rf.me, PrevLogIndex, PrevLogTerm, Entries, rf.commitIndex)
 	}
@@ -140,55 +152,43 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	reply.SuggestNext = -1
 	reply.ConflictTerm = -1
 	// Reply false if log does not contain an entry at prevLogIndex
-	if len(rf.log)-1 < args.PrevLogIndex {
+	if rf.lastIncludedIndex+len(rf.log)-1 < args.PrevLogIndex {
 		reply.Success = false
-		reply.SuggestNext = len(rf.log)
+		reply.SuggestNext = len(rf.log) + rf.lastIncludedIndex
+		return
+	}
+
+	// As we are about to compare log with index PrevLogIndex, we need to make sure
+	// that we have that entry in our log
+	if args.PrevLogIndex <= rf.lastIncludedIndex {
+		// As the logs prior to this has already committed, it must be a match
+		rf.tryAppendNewEntries(args.Entries, args.PrevLogIndex)
+		reply.Success = true
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, rf.lastIncludedIndex+len(rf.log)-1)
+		}
 		return
 	}
 
 	// Conflict not match term for prevLogIndex
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if rf.log[args.PrevLogIndex-rf.lastIncludedIndex].Term != args.PrevLogTerm {
 		// Conflict, delete the existing entry and all that follow it
-		t := rf.log[args.PrevLogIndex].Term
+		t := rf.log[args.PrevLogIndex-rf.lastIncludedIndex].Term
 		reply.Success = false
 		reply.ConflictTerm = t
 		reply.SuggestNext = rf.findFirstIndexWithTerm(reply.ConflictTerm, args.PrevLogIndex)
-		rf.log = rf.log[0:args.PrevLogIndex]
+		rf.log = rf.log[0 : args.PrevLogIndex-rf.lastIncludedIndex]
 		rf.persist()
 		return
 	}
 
 	// No conflict on prevLogIndex
-	for i := range args.Entries {
-		// First test if my log has this entry or not
-		if len(rf.log)-1 < args.PrevLogIndex+i+1 {
-			// Append all the entries following it.
-			rf.log = append(rf.log, args.Entries[i:]...)
-			MyDebug(dLog, "S%d appends entries %v to its log", rf.me, args.Entries[i:])
-			MyDebug(dLog, "S%d new log:%v", rf.me, rf.log)
-			rf.persist()
-			break
-		}
-
-		// Compare the term
-		index := args.PrevLogIndex + i + 1
-		if rf.log[index].Term == args.Entries[i].Term {
-			continue
-		} else {
-			// Delete and append
-			rf.log = rf.log[0:index]
-			rf.log = append(rf.log, args.Entries[i:]...)
-			rf.persist()
-			MyDebug(dLog, "S%d appends entries %v to its log", rf.me, args.Entries[i:])
-			MyDebug(dLog, "S%d new log:%v", rf.me, rf.log)
-			break
-		}
-	}
+	rf.tryAppendNewEntries(args.Entries, args.PrevLogIndex)
 	reply.Success = true
 
 	// Update commitIndex
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1+rf.lastIncludedIndex)
 	}
 	return
 }
@@ -197,7 +197,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 // Find the first log entry with term t
 // Or the last entry with term number t - 1
 func (rf *Raft) findFirstIndexWithTerm(t, startIndex int) int {
-	for ; startIndex > 0 && rf.log[startIndex].Term == t; startIndex-- {
+	for ; startIndex > rf.commitIndex && startIndex > rf.lastIncludedIndex && rf.log[startIndex-rf.lastIncludedIndex].Term == t; startIndex-- {
 
 	}
 	return startIndex + 1
@@ -217,4 +217,37 @@ func max(a, b int) int {
 	}
 
 	return b
+}
+
+//Invoke under lock
+func (rf *Raft) tryAppendNewEntries(Entries []LogEntry, PrevLogIndex int) {
+	for i := range Entries {
+		if PrevLogIndex+i+1 <= rf.lastIncludedIndex {
+			continue
+		}
+		// First test if my log has this entry or not
+		if len(rf.log)-1+rf.lastIncludedIndex < PrevLogIndex+i+1 {
+			// Append all the entries following it.
+			rf.log = append(rf.log, Entries[i:]...)
+			MyDebug(dLog, "S%d appends entries %v to its log", rf.me, Entries[i:])
+			MyDebug(dLog, "S%d new log:%v", rf.me, rf.log)
+			rf.persist()
+			break
+		}
+
+		// Compare the term
+		index := PrevLogIndex + i + 1
+		if rf.log[index-rf.lastIncludedIndex].Term == Entries[i].Term {
+			continue
+		} else {
+			// Delete and append
+			rf.log = rf.log[0 : index-rf.lastIncludedIndex]
+			rf.log = append(rf.log, Entries[i:]...)
+			rf.persist()
+			MyDebug(dLog, "S%d appends entries %v to its log", rf.me, Entries[i:])
+			MyDebug(dLog, "S%d new log:%v", rf.me, rf.log)
+			break
+		}
+	}
+
 }

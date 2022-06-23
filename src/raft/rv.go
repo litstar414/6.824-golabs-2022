@@ -70,8 +70,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
-		lastLogIndex := len(rf.log) - 1
-		lastLogTerm := rf.log[lastLogIndex].Term
+		lastLogIndex := len(rf.log) - 1 + rf.lastIncludedIndex
+		lastLogTerm := rf.log[len(rf.log)-1].Term
 		if upToDate(args.LastLogTerm, args.LastLogIndex, lastLogTerm, lastLogIndex) {
 			rf.votedFor = args.CandidateId
 			reply.Term = rf.currentTerm
@@ -105,10 +105,9 @@ func upToDate(t1, i1, t2, i2 int) bool {
 // Invoke this function should held the lock
 func (rf *Raft) broadcastRV() {
 	args := RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateId: rf.me,
-		// TODO: implement LastLogIndex and LastLogTerm
-		LastLogIndex: len(rf.log) - 1,
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: len(rf.log) - 1 + rf.lastIncludedIndex,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
 

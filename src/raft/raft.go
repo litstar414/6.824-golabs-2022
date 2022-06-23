@@ -159,6 +159,9 @@ type Raft struct {
 	matchIndex []int
 	// Start index for this term
 	termStartIndex int
+	// The log start index (for 2D)
+	lastIncludedIndex int
+	lastIncludedTerm  int
 
 	state     state
 	lastReset time.Time
@@ -201,9 +204,9 @@ func (rf *Raft) converToCandidate() {
 func (rf *Raft) leaderInitialize() {
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
-	rf.termStartIndex = len(rf.log)
+	rf.termStartIndex = len(rf.log) + rf.lastIncludedIndex
 	for i := range rf.nextIndex {
-		rf.nextIndex[i] = len(rf.log)
+		rf.nextIndex[i] = len(rf.log) + rf.lastIncludedIndex
 		rf.matchIndex[i] = 0
 	}
 
@@ -246,6 +249,8 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	for i := range rf.log {
 		if i == 0 {
 			continue
@@ -254,8 +259,8 @@ func (rf *Raft) persist() {
 	}
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
-	MyDebug(dPersist, "S%d stores state->currentTerm:%d votedFor:%d log:%v",
-		rf.me, rf.currentTerm, rf.votedFor, rf.log)
+	MyDebug(dPersist, "S%d stores state->currentTerm:%d votedFor:%d log:%v lastIncludedIndex:%v",
+		rf.me, rf.currentTerm, rf.votedFor, rf.log, rf.lastIncludedIndex)
 
 }
 
@@ -273,13 +278,19 @@ func (rf *Raft) readPersist(data []byte) {
 	d := labgob.NewDecoder(r)
 	var currentTerm int
 	var votedFor int
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	if d.Decode(&currentTerm) != nil ||
-		d.Decode(&votedFor) != nil {
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil {
 		// error occurs
 		MyDebug(dPersist, "S%d reads from persister failed", rf.me)
 	} else {
 		rf.votedFor = votedFor
 		rf.currentTerm = currentTerm
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 	}
 
 	// Tries to decode the log from the decoder
@@ -292,32 +303,12 @@ func (rf *Raft) readPersist(data []byte) {
 
 	// Error occurs
 	if e == io.EOF {
-		MyDebug(dPersist, "S%d restore finished with state currentTerm:%d votedFor:%d rf.log:%v",
-			rf.me, rf.currentTerm, rf.votedFor, rf.log)
+		MyDebug(dPersist, "S%d restore finished with state currentTerm:%d votedFor:%d rf.log:%v lastIncludedIndex:%v",
+			rf.me, rf.currentTerm, rf.votedFor, rf.log, rf.lastIncludedIndex)
 	} else {
 		// Error occurs
 		MyDebug(dPersist, "S%d reads from persister failed with error:%v", rf.me, e)
 	}
-}
-
-//
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
-// have more recent info since it communicate the snapshot on applyCh.
-//
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
-	return true
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-
 }
 
 //
@@ -358,7 +349,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.log = append(rf.log, c)
 	rf.persist()
-	index = len(rf.log) - 1
+	index = rf.lastIncludedIndex + len(rf.log) - 1
 
 	MyDebug(dLog, "S%d Leader new command received:%v in term %d", rf.me, command, rf.currentTerm)
 	// Start synchronize
@@ -437,19 +428,13 @@ func (rf *Raft) sendCommandToQ() {
 		rf.mu.Lock()
 		commitIndex := rf.commitIndex
 		MyDebug(dTrace, "S%d tries to release the lock in Ch thread", rf.me)
-		/*WARNING: Unlock here will cause races as we do not protect rf.log*/
-		/*with the lock.  However, I think it is quite safe to do so as we will only*/
-		/*tries to read the commited logs which should never be changed by AE RPC.*/
-		/*It do cause tests with race flag to fail, but it speeds up the tests by*/
-		/*around 10s*/
-		rf.mu.Unlock()
 
 		if sentIndex < commitIndex {
 			rf.messageLock.Lock()
 			for sentIndex < commitIndex {
 				temp := ApplyMsg{
 					CommandValid: true,
-					Command:      rf.log[sentIndex+1].Command,
+					Command:      rf.log[sentIndex+1-rf.lastIncludedIndex].Command,
 					CommandIndex: sentIndex + 1,
 				}
 				sentIndex += 1
@@ -459,9 +444,11 @@ func (rf *Raft) sendCommandToQ() {
 			// We have new things to consume
 			rf.cond.Signal()
 		}
+		rf.mu.Unlock()
 	}
 }
 
+// TODO: garbage collection
 func (rf *Raft) applyFromQ(applyCh chan ApplyMsg) {
 	for rf.killed() == false {
 		// Wait for update
@@ -522,7 +509,7 @@ func (rf *Raft) checkIfCommit(index int) bool {
 			}
 		} else {
 			// self
-			if len(rf.log)-1 >= index {
+			if len(rf.log)-1+rf.lastIncludedIndex >= index {
 				count += 1
 			}
 		}
@@ -569,6 +556,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Term:    0,
 	})
 	rf.state = Follower
+	// Set the default value for lastIncludedIndex
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 
 	rf.lastReset = time.Now()
 	rf.messageQ = make([]ApplyMsg, 0)
@@ -577,6 +567,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 2C reads from persist storage if there are any
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	// TODO: send a snapshot to the service by the applyCh to recover the service from failure
+	// TODO: In that case, we should also set the corresponding lastIncludedIndex
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
