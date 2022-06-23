@@ -38,6 +38,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Now try to trim the log
 	rf.trimLog(index)
 	rf.lastIncludedIndex = index
+  rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
 }
 
 // Invoke on lock
