@@ -111,12 +111,7 @@ func (rf *Raft) broadcastAE() {
 				rf.me, PrevLogIndex, rf.lastIncludedIndex)
 			continue
 		}
-		var PrevLogTerm int
-		if PrevLogIndex == rf.lastIncludedIndex {
-			PrevLogTerm = rf.lastIncludedTerm
-		} else {
-			PrevLogTerm = rf.log[PrevLogIndex-rf.lastIncludedIndex].Term
-		}
+		PrevLogTerm := rf.findRelatedTerm(PrevLogIndex)
 		// Prepare Entries, as we may cut this while sending the rpc, create a new one
 		Entries := append([]LogEntry{}, rf.log[rf.nextIndex[i]-rf.lastIncludedIndex:]...)
 		MyDebug(dLeader, "S%d Leader sends AE to server %d in term %d with entries:%v", rf.me, i, rf.currentTerm, Entries)
@@ -177,7 +172,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.Success = false
 		reply.ConflictTerm = t
 		reply.SuggestNext = rf.findFirstIndexWithTerm(reply.ConflictTerm, args.PrevLogIndex)
-		rf.log = rf.log[0 : args.PrevLogIndex-rf.lastIncludedIndex]
+		rf.ResetLog(rf.log, 1, args.PrevLogIndex-rf.lastIncludedIndex)
 		rf.persist()
 		return
 	}
@@ -241,7 +236,7 @@ func (rf *Raft) tryAppendNewEntries(Entries []LogEntry, PrevLogIndex int) {
 			continue
 		} else {
 			// Delete and append
-			rf.log = rf.log[0 : index-rf.lastIncludedIndex]
+			rf.ResetLog(rf.log, 1, index-rf.lastIncludedIndex)
 			rf.log = append(rf.log, Entries[i:]...)
 			rf.persist()
 			MyDebug(dLog, "S%d appends entries %v to its log", rf.me, Entries[i:])

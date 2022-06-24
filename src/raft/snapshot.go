@@ -38,7 +38,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Now try to trim the log
 	rf.trimLog(index)
 	rf.lastIncludedIndex = index
-  rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
+	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
 }
 
 // Invoke on lock
@@ -48,9 +48,9 @@ func (rf *Raft) trimLog(index int) {
 	// Do we have the next element?
 	if len(rf.log)-1 > deleteLength {
 		// Safe operation
-		rf.log = append(rf.log[0:1], rf.log[deleteLength+1:]...)
+		rf.ResetLog(rf.log, deleteLength+1, -1)
 	} else {
 		// Just delete all the logs
-		rf.log = rf.log[0:1]
+		rf.ResetLog(nil, -1, -1)
 	}
 }

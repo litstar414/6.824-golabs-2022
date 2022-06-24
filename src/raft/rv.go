@@ -71,7 +71,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		lastLogIndex := len(rf.log) - 1 + rf.lastIncludedIndex
-		lastLogTerm := rf.log[len(rf.log)-1].Term
+		lastLogTerm := rf.findRelatedTerm(lastLogIndex)
 		if upToDate(args.LastLogTerm, args.LastLogIndex, lastLogTerm, lastLogIndex) {
 			rf.votedFor = args.CandidateId
 			reply.Term = rf.currentTerm
@@ -108,8 +108,8 @@ func (rf *Raft) broadcastRV() {
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: len(rf.log) - 1 + rf.lastIncludedIndex,
-		LastLogTerm:  rf.log[len(rf.log)-1].Term,
 	}
+	args.LastLogTerm = rf.findRelatedTerm(args.LastLogIndex)
 
 	count := 1
 

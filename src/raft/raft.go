@@ -520,6 +520,37 @@ func (rf *Raft) checkIfCommit(index int) bool {
 	return false
 }
 
+// Invoke on lock
+func (rf *Raft) ResetLog(ori []LogEntry, left, right int) {
+	temp := make([]LogEntry, 0)
+	temp = append(temp, LogEntry{Command: -1, Term: 0})
+	if ori != nil {
+		if left == -1 {
+			left = 0
+		}
+		if right == -1 {
+			right = len(ori)
+		}
+		if right >= left {
+			temp = append(temp, ori[left:right]...)
+		}
+	}
+	rf.log = temp
+}
+
+// Invoke under lock
+func (rf *Raft) findRelatedTerm(index int) int {
+	var term int
+	if index == rf.lastIncludedIndex {
+		term = rf.lastIncludedTerm
+	} else if index < rf.lastIncludedIndex {
+		panic("Invalid index found in snapshot")
+	} else {
+		term = rf.log[index-rf.lastIncludedIndex].Term
+	}
+	return term
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
