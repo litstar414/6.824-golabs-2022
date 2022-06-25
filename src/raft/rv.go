@@ -77,7 +77,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.currentTerm
 			reply.VoteGranted = true
 			rf.lastReset = time.Now()
-			rf.persist()
+			data := rf.persist()
+			rf.persister.SaveRaftState(data)
 			return
 		} else {
 			reply.Term = rf.currentTerm

@@ -23,7 +23,7 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	MyDebug(dTrace, "S%d tries to acquire lock in ISS handler", rf.me)
 	rf.mu.Lock()
-	rf.mu.Unlock()
+	defer rf.mu.Unlock()
 	defer MyDebug(dTrace, "S%d release the lock in ISS handler", rf.me)
 
 	rf.checkTerm(args.Term)
@@ -41,10 +41,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	// The log entry might already in the snapshot
 	if args.LastIncludedIndex <= rf.commitIndex {
+		MyDebug(dSnap, "S%d receives a stale snapshot", rf.me)
 		return
 	}
 
 	// Send the snapshot to applyCh
+	MyDebug(dSnap, "S%d sends a snapshot to applyCh in installSnapshot rpc", rf.me)
 	go func() {
 		rf.applyCh <- ApplyMsg{
 			CommandValid:  false,
@@ -58,7 +60,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// Save the state to disk
 	// The return to this function tells the leader that I as a follower have all the information
 	// up to this snapshot, so we must save the snapshot before return
-	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), args.Snapshot)
+	//rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), args.Snapshot)
 }
 
 //
@@ -76,6 +78,7 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	defer rf.mu.Unlock()
 
 	if lastIncludedIndex <= rf.commitIndex {
+		MyDebug(dSnap, "S%d condInstallSnap stale", rf.me)
 		return false
 	}
 
@@ -84,6 +87,8 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	if len(rf.log)-1+rf.lastIncludedIndex < lastIncludedIndex {
 		// discard the entire log
 		rf.ResetLog(nil, -1, -1)
+	} else if lastIncludedIndex == rf.lastIncludedIndex {
+		// DO nothing
 	} else if rf.log[lastIncludedIndex-rf.lastIncludedIndex].Term == lastIncludedTerm {
 		rf.ResetLog(rf.log, lastIncludedIndex-rf.lastIncludedIndex+1, -1)
 	} else {
@@ -92,8 +97,12 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
 	rf.commitIndex = lastIncludedIndex
-	rf.lastApplied = lastIncludedIndex
-	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
+	rf.lastApplied = max(lastIncludedIndex, rf.lastApplied)
+	MyDebug(dSnap, "S%d recover its lastIncludedIndex to %d", rf.me, rf.lastIncludedIndex)
+	data := rf.persist()
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
+	MyDebug(dSnap, "S%d apply the snapshot with lastIncludedIndex:%d", rf.me, lastIncludedIndex)
+	MyDebug(dCommit, "S%d apply the snapshot with lastIncludedIndex:%d", rf.me, lastIncludedIndex)
 	return true
 
 	// check the term and index
@@ -123,11 +132,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Now try to trim the log
 	rf.trimLog(index)
 	rf.lastIncludedIndex = index
-	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
+	data := rf.persist()
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
+	MyDebug(dSnap, "S%d takes a snapshot with new log:%v, new lastIncludedIndex:%v", rf.me, rf.log, rf.lastIncludedIndex)
 }
 
 // Invoke on lock
 func (rf *Raft) trimLog(index int) {
+	//MyDebug(dSnap, "S%d before trim log:%v, prev lII:%v new lII:%v", rf.me, rf.log, rf.lastIncludedIndex, index)
 	deleteLength := index - rf.lastIncludedIndex
 
 	// Do we have the next element?
@@ -138,6 +150,7 @@ func (rf *Raft) trimLog(index int) {
 		// Just delete all the logs
 		rf.ResetLog(nil, -1, -1)
 	}
+	//MyDebug(dSnap, "S%d after trim log:%v", rf.me, rf.log)
 }
 
 // Does not require lock(rf.mu)

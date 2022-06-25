@@ -176,7 +176,8 @@ func (rf *Raft) checkTerm(term int) bool {
 	if term > rf.currentTerm {
 		rf.votedFor = -1
 		rf.currentTerm = term
-		rf.persist()
+		data := rf.persist()
+		rf.persister.SaveRaftState(data)
 		if rf.state != Follower {
 			MyDebug(dTimer, "S%d sees a bigger term %d, revert to follower", rf.me, term)
 			rf.state = Follower
@@ -194,7 +195,8 @@ func (rf *Raft) converToCandidate() {
 	rf.lastReset = time.Now()
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
-	rf.persist()
+	data := rf.persist()
+	rf.persister.SaveRaftState(data)
 	rf.broadcastRV()
 }
 
@@ -242,7 +244,7 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 // Invoke under lock
-func (rf *Raft) persist() {
+func (rf *Raft) persist() []byte {
 	// Your code here (2C).
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -257,20 +259,21 @@ func (rf *Raft) persist() {
 		e.Encode(rf.log[i])
 	}
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	//rf.persister.SaveRaftState(data)
 	MyDebug(dPersist, "S%d stores state->currentTerm:%d votedFor:%d log:%v lastIncludedIndex:%v",
 		rf.me, rf.currentTerm, rf.votedFor, rf.log, rf.lastIncludedIndex)
 
+	return data
 }
 
 //
 // restore previously persisted state.
 //
 // We should probably run this code after initialization
-func (rf *Raft) readPersist(data []byte) {
+func (rf *Raft) readPersist(data []byte) (int, int) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		MyDebug(dPersist, "S%d no previous information found from persist", rf.me)
-		return
+		return 0, 0
 	}
 	// Your code here (2C).
 	r := bytes.NewBuffer(data)
@@ -288,8 +291,6 @@ func (rf *Raft) readPersist(data []byte) {
 	} else {
 		rf.votedFor = votedFor
 		rf.currentTerm = currentTerm
-		rf.lastIncludedIndex = lastIncludedIndex
-		rf.lastIncludedTerm = lastIncludedTerm
 	}
 
 	// Tries to decode the log from the decoder
@@ -308,6 +309,7 @@ func (rf *Raft) readPersist(data []byte) {
 		// Error occurs
 		MyDebug(dPersist, "S%d reads from persister failed with error:%v", rf.me, e)
 	}
+	return lastIncludedIndex, lastIncludedTerm
 }
 
 //
@@ -350,7 +352,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.log = append(rf.log, c)
-	rf.persist()
+	data := rf.persist()
+	rf.persister.SaveRaftState(data)
 	index = rf.lastIncludedIndex + len(rf.log) - 1
 
 	MyDebug(dLog, "S%d Leader new command received:%v in term %d", rf.me, command, rf.currentTerm)
@@ -425,37 +428,32 @@ func (rf *Raft) ticker() {
 func (rf *Raft) sendCommands(applyCh chan ApplyMsg) {
 	for rf.killed() == false {
 		// Wait for update
-		MyDebug(dCommit, "S%d tries to acquire the lock in sc thread", rf.me)
 		rf.mu.Lock()
-		MyDebug(dCommit, "S%d acquired the lock in sc thread", rf.me)
 		for rf.lastApplied >= rf.commitIndex {
-			MyDebug(dCommit, "S%d release the lock in sc thread", rf.me)
 			rf.cond.Wait()
-			MyDebug(dCommit, "S%d acquired the lock in sc thread", rf.me)
 		}
 
 		lastApplied := rf.lastApplied
 
 		Entries := make([]LogEntry, 0)
+		// There is a race conditon, in the initial snapshot, the lastApplied is set to 0, but lastIncludedIndex is set to its original value
 		Entries = append(Entries, rf.log[rf.lastApplied+1-rf.lastIncludedIndex:rf.commitIndex+1-rf.lastIncludedIndex]...)
 
 		rf.mu.Unlock()
-		MyDebug(dCommit, "S%d release the lock in sc thread3", rf.me)
 		for i := range Entries {
-			applyCh <- ApplyMsg{
+			msg := ApplyMsg{
 				CommandValid: true,
 				Command:      Entries[i].Command,
 				CommandIndex: lastApplied + 1,
 			}
+			applyCh <- msg
+			MyDebug(dCommit, "S%d applies %d with index%d", rf.me, msg.Command, msg.CommandIndex)
 			lastApplied += 1
 		}
 
-		MyDebug(dCommit, "S%d tries to acquire the lock in sc thread2", rf.me)
 		rf.mu.Lock()
-		MyDebug(dCommit, "S%d acquired the lock in sc thread2", rf.me)
 		rf.lastApplied = max(rf.lastApplied, lastApplied)
 		rf.mu.Unlock()
-		MyDebug(dCommit, "S%d release the lock in sc thread4444", rf.me)
 	}
 
 }
@@ -591,12 +589,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastReset = time.Now()
 	rf.cond = sync.NewCond(&rf.mu)
 
+	MyDebug(dSnap, "S%d restarts", rf.me)
+
 	// 2C reads from persist storage if there are any
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
-	rf.commitIndex = rf.lastIncludedIndex
-	rf.lastApplied = rf.lastIncludedIndex
-	rf.readPersistSnapshot(rf.persister.ReadSnapshot(), applyCh)
+	lastIncludedIndex, lastIncludedTerm := rf.readPersist(persister.ReadRaftState())
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = lastIncludedTerm
+	rf.lastApplied = lastIncludedIndex
+	// Potentially set lastApplied and commitIndex to 0
+
+	rf.readPersistSnapshot(rf.persister.ReadSnapshot(), applyCh, lastIncludedIndex, lastIncludedTerm)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
@@ -609,21 +612,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 // restore previously persisted snapshot
 // Can only be called in the start of make
-func (rf *Raft) readPersistSnapshot(data []byte, applyCh chan ApplyMsg) {
+func (rf *Raft) readPersistSnapshot(data []byte, applyCh chan ApplyMsg, lastIncludedIndex, lastIncludedTerm int) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		MyDebug(dSnap, "S%d no previous information found for snapshot", rf.me)
 		return
 	}
-
-	// We have data for the snapshot
-	// Send a snapshot to the applyCh
-	msg := ApplyMsg{
-		CommandValid:  false,
-		SnapshotValid: true,
-		Snapshot:      data,
-		SnapshotTerm:  rf.lastIncludedTerm,
-		SnapshotIndex: rf.lastIncludedIndex,
-	}
-	// Reset the sentIndex
-	applyCh <- msg
+	go func() {
+		msg := ApplyMsg{
+			CommandValid:  false,
+			SnapshotValid: true,
+			Snapshot:      data,
+			SnapshotTerm:  lastIncludedTerm,
+			SnapshotIndex: lastIncludedIndex,
+		}
+		// Reset the sentIndex
+		applyCh <- msg
+		MyDebug(dSnap, "S%d reboots and sends a snapshot to service", rf.me)
+	}()
 }

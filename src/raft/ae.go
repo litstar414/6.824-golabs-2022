@@ -173,7 +173,8 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.ConflictTerm = t
 		reply.SuggestNext = rf.findFirstIndexWithTerm(reply.ConflictTerm, args.PrevLogIndex)
 		rf.ResetLog(rf.log, 1, args.PrevLogIndex-rf.lastIncludedIndex)
-		rf.persist()
+		data := rf.persist()
+		rf.persister.SaveRaftState(data)
 		return
 	}
 
@@ -227,7 +228,8 @@ func (rf *Raft) tryAppendNewEntries(Entries []LogEntry, PrevLogIndex int) {
 			rf.log = append(rf.log, Entries[i:]...)
 			MyDebug(dLog, "S%d appends entries %v to its log", rf.me, Entries[i:])
 			MyDebug(dLog, "S%d new log:%v", rf.me, rf.log)
-			rf.persist()
+			data := rf.persist()
+			rf.persister.SaveRaftState(data)
 			break
 		}
 
@@ -239,7 +241,8 @@ func (rf *Raft) tryAppendNewEntries(Entries []LogEntry, PrevLogIndex int) {
 			// Delete and append
 			rf.ResetLog(rf.log, 1, index-rf.lastIncludedIndex)
 			rf.log = append(rf.log, Entries[i:]...)
-			rf.persist()
+			data := rf.persist()
+			rf.persister.SaveRaftState(data)
 			MyDebug(dLog, "S%d appends entries %v to its log", rf.me, Entries[i:])
 			MyDebug(dLog, "S%d new log:%v", rf.me, rf.log)
 			break
