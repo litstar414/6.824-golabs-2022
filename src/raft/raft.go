@@ -166,9 +166,7 @@ type Raft struct {
 	state     state
 	lastReset time.Time
 
-	messageQ    []ApplyMsg
-	messageLock sync.Mutex // Lock to protect shared access to this peer's state
-	cond        *sync.Cond
+	cond *sync.Cond
 }
 
 // To invoke this function, lock should be held
@@ -408,8 +406,8 @@ func (rf *Raft) ticker() {
 				rf.broadcastAE()
 			}
 		}
-		MyDebug(dTrace, "S%d releases the lock in main thread", rf.me)
 		rf.mu.Unlock()
+		MyDebug(dTrace, "S%d releases the lock in main thread", rf.me)
 
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
@@ -419,54 +417,38 @@ func (rf *Raft) ticker() {
 	}
 }
 
-// No lock acquired on invoke
-func (rf *Raft) sendCommandToQ() {
-	sentIndex := 0
-	for rf.killed() == false {
-		time.Sleep(10 * time.Millisecond)
-		MyDebug(dTrace, "S%d tries to acquire lock in Ch thread", rf.me)
-		rf.mu.Lock()
-		commitIndex := rf.commitIndex
-		MyDebug(dTrace, "S%d tries to release the lock in Ch thread", rf.me)
-
-		if sentIndex < commitIndex {
-			rf.messageLock.Lock()
-			for sentIndex < commitIndex {
-				temp := ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[sentIndex+1-rf.lastIncludedIndex].Command,
-					CommandIndex: sentIndex + 1,
-				}
-				sentIndex += 1
-				rf.messageQ = append(rf.messageQ, temp)
-			}
-			rf.messageLock.Unlock()
-			// We have new things to consume
-			rf.cond.Signal()
-		}
-		rf.mu.Unlock()
-	}
-}
-
-// TODO: garbage collection
-func (rf *Raft) applyFromQ(applyCh chan ApplyMsg) {
+func (rf *Raft) sendCommands(applyCh chan ApplyMsg) {
 	for rf.killed() == false {
 		// Wait for update
-		rf.messageLock.Lock()
-		rf.cond.Wait()
-		// Apply all the entries on messageQ
-		for i := range rf.messageQ {
-			MyDebug(dLog, "S%d apply command %v", rf.me, rf.messageQ[i].Command)
-			applyCh <- rf.messageQ[i]
+		MyDebug(dTrace, "S%d tries to acquire the lock in sc thread", rf.me)
+		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex {
+			MyDebug(dTrace, "S%d release the lock in sc thread", rf.me)
+			rf.cond.Wait()
 		}
 
-		// Now delete all the entries on the messageQ
-		rf.messageQ = rf.messageQ[0:0]
-		rf.messageLock.Unlock()
+		lastApplied := rf.lastApplied
+
+		Entries := make([]LogEntry, 0)
+		Entries = append(Entries, rf.log[rf.lastApplied+1-rf.lastIncludedIndex:rf.commitIndex+1-rf.lastIncludedIndex]...)
+
+		rf.mu.Unlock()
+		for i := range Entries {
+			applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      Entries[i].Command,
+				CommandIndex: lastApplied + 1,
+			}
+			lastApplied += 1
+		}
+
+		rf.mu.Lock()
+		rf.lastApplied = max(rf.lastApplied, lastApplied)
+		rf.mu.Unlock()
 	}
+
 }
 
-// Invoke under lock
 func (rf *Raft) updateLeaderCommit(term int) {
 	for rf.killed() == false {
 		time.Sleep(10 * time.Millisecond)
@@ -484,15 +466,16 @@ func (rf *Raft) updateLeaderCommit(term int) {
 			// Then try leaderCommit + 1
 			if rf.checkIfCommit(rf.commitIndex + 1) {
 				rf.commitIndex += 1
+				rf.cond.Signal()
 			}
 		} else {
 			// Try termStartIndex
 			// What if termStartIndex not exist
 			if rf.checkIfCommit(rf.termStartIndex) {
 				rf.commitIndex = rf.termStartIndex
+				rf.cond.Signal()
 			}
 		}
-		MyDebug(dTrace, "S%d releases the lock in updateLeaderCommit thread", rf.me)
 		rf.mu.Unlock()
 	}
 }
@@ -592,8 +575,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastIncludedTerm = 0
 
 	rf.lastReset = time.Now()
-	rf.messageQ = make([]ApplyMsg, 0)
-	rf.cond = sync.NewCond(&rf.messageLock)
+	rf.cond = sync.NewCond(&rf.mu)
 
 	// 2C reads from persist storage if there are any
 	// initialize from state persisted before a crash
@@ -601,11 +583,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// TODO: send a snapshot to the service by the applyCh to recover the service from failure
 	// TODO: In that case, we should also set the corresponding lastIncludedIndex
+	// TODO: Reboot may cause error in rf.sendCommands
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.sendCommandToQ()
-	go rf.applyFromQ(applyCh)
+	go rf.sendCommands(applyCh)
+	//go rf.sendCommandToQ()
+	//go rf.applyFromQ(applyCh)
 
 	return rf
 }

@@ -24,6 +24,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	// Acquire the lock
 	rf.mu.Lock()
+	MyDebug(dTrace, "S%d acquired the lock in Snapshot", rf.me)
+	defer MyDebug(dTrace, "S%d releases the lock in Snapshot", rf.me)
 	defer rf.mu.Unlock()
 
 	// Try to trim the log

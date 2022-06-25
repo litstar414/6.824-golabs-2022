@@ -123,8 +123,8 @@ func (rf *Raft) broadcastAE() {
 func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	MyDebug(dTrace, "S%d tries to acquire lock in AE handler", rf.me)
 	rf.mu.Lock()
+	defer MyDebug(dTrace, "S%d releases the lock in AE handler", rf.me)
 	defer rf.mu.Unlock()
-	defer MyDebug(dTrace, "S%d release the lock in AE handler", rf.me)
 
 	rf.checkTerm(args.Term)
 	// Reply false if term < currentTerm
@@ -161,6 +161,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 		reply.Success = true
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(args.LeaderCommit, rf.lastIncludedIndex+len(rf.log)-1)
+			rf.cond.Signal()
 		}
 		return
 	}
@@ -184,6 +185,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	// Update commitIndex
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1+rf.lastIncludedIndex)
+		rf.cond.Signal()
 	}
 	return
 }
