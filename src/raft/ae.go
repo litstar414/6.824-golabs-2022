@@ -40,8 +40,8 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntryArgs, reply *Append
 func (rf *Raft) handleAEReply(server int, args *AppendEntryArgs, reply *AppendEntryReply, term int, prevLogIndex int) {
 	MyDebug(dTrace, "S%d tries to acquire the lock in MHAE", rf.me)
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	defer MyDebug(dTrace, "S%d release the lock in MHAE", rf.me)
+	defer rf.mu.Unlock()
 
 	if rf.checkTerm(reply.Term) {
 		return
@@ -105,10 +105,9 @@ func (rf *Raft) broadcastAE() {
 		//Prepare the arguments
 		PrevLogIndex := rf.nextIndex[i] - 1
 		if PrevLogIndex < rf.lastIncludedIndex {
-			// TODO: PrevLogIndex may in the snapshot, in that case, we should send the snapshot
-			// TODO: send snapshot
-			MyDebug(dSnap, "S%d sends snapshot for server %d with PrevLogIndex:%v lastIncludedIndex:%v",
-				rf.me, PrevLogIndex, rf.lastIncludedIndex)
+			MyDebug(dSnap, "S%d sends snapshot for server %d with lastIncludedIndex:%v",
+				rf.me, i, rf.lastIncludedIndex)
+			go rf.handleIS(i, rf.currentTerm, rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, rf.persister.ReadSnapshot())
 			continue
 		}
 		PrevLogTerm := rf.findRelatedTerm(PrevLogIndex)

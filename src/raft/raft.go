@@ -165,6 +165,7 @@ type Raft struct {
 
 	state     state
 	lastReset time.Time
+	applyCh   chan ApplyMsg
 
 	cond *sync.Cond
 }
@@ -329,7 +330,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	MyDebug(dTrace, "S%d tries to acquire the lock in start", rf.me)
 	rf.mu.Lock()
+	MyDebug(dTrace, "S%d acquired the lock in start", rf.me)
+	defer MyDebug(dTrace, "S%d releases the lock in start", rf.me)
 	defer rf.mu.Unlock()
 
 	term = rf.currentTerm
@@ -388,6 +392,7 @@ func (rf *Raft) ticker() {
 		time.Sleep(SLEEP_INTERVAL * time.Millisecond)
 		MyDebug(dTrace, "S%d tries to acquire lock in main thread", rf.me)
 		rf.mu.Lock()
+		MyDebug(dTrace, "S%d acquired lock in main thread", rf.me)
 		switch rf.state {
 		case Follower:
 			if time.Since(rf.lastReset).Milliseconds() > int64(rf.getRandomValue()) {
@@ -420,11 +425,13 @@ func (rf *Raft) ticker() {
 func (rf *Raft) sendCommands(applyCh chan ApplyMsg) {
 	for rf.killed() == false {
 		// Wait for update
-		MyDebug(dTrace, "S%d tries to acquire the lock in sc thread", rf.me)
+		MyDebug(dCommit, "S%d tries to acquire the lock in sc thread", rf.me)
 		rf.mu.Lock()
+		MyDebug(dCommit, "S%d acquired the lock in sc thread", rf.me)
 		for rf.lastApplied >= rf.commitIndex {
-			MyDebug(dTrace, "S%d release the lock in sc thread", rf.me)
+			MyDebug(dCommit, "S%d release the lock in sc thread", rf.me)
 			rf.cond.Wait()
+			MyDebug(dCommit, "S%d acquired the lock in sc thread", rf.me)
 		}
 
 		lastApplied := rf.lastApplied
@@ -433,6 +440,7 @@ func (rf *Raft) sendCommands(applyCh chan ApplyMsg) {
 		Entries = append(Entries, rf.log[rf.lastApplied+1-rf.lastIncludedIndex:rf.commitIndex+1-rf.lastIncludedIndex]...)
 
 		rf.mu.Unlock()
+		MyDebug(dCommit, "S%d release the lock in sc thread3", rf.me)
 		for i := range Entries {
 			applyCh <- ApplyMsg{
 				CommandValid: true,
@@ -442,9 +450,12 @@ func (rf *Raft) sendCommands(applyCh chan ApplyMsg) {
 			lastApplied += 1
 		}
 
+		MyDebug(dCommit, "S%d tries to acquire the lock in sc thread2", rf.me)
 		rf.mu.Lock()
+		MyDebug(dCommit, "S%d acquired the lock in sc thread2", rf.me)
 		rf.lastApplied = max(rf.lastApplied, lastApplied)
 		rf.mu.Unlock()
+		MyDebug(dCommit, "S%d release the lock in sc thread4444", rf.me)
 	}
 
 }
@@ -454,9 +465,10 @@ func (rf *Raft) updateLeaderCommit(term int) {
 		time.Sleep(10 * time.Millisecond)
 		MyDebug(dTrace, "S%d tries to acquire lock in updateLeaderCommit thread", rf.me)
 		rf.mu.Lock()
+		MyDebug(dTrace, "S%d acquired lock in updateLeaderCommit thread", rf.me)
 		if rf.currentTerm != term {
-			MyDebug(dTrace, "S%d releases the lock in updateLeaderCommit thread", rf.me)
 			rf.mu.Unlock()
+			MyDebug(dTrace, "S%d releases the lock in updateLeaderCommit thread", rf.me)
 			return
 		}
 		// Still leader, try to update leaderCommit
@@ -477,6 +489,7 @@ func (rf *Raft) updateLeaderCommit(term int) {
 			}
 		}
 		rf.mu.Unlock()
+		MyDebug(dTrace, "S%d releases the lock in updateLeaderCommit thread", rf.me)
 	}
 }
 
@@ -552,6 +565,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.applyCh = applyCh
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
@@ -580,10 +594,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 2C reads from persist storage if there are any
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
-	// TODO: send a snapshot to the service by the applyCh to recover the service from failure
-	// TODO: In that case, we should also set the corresponding lastIncludedIndex
-	// TODO: Reboot may cause error in rf.sendCommands
+	rf.commitIndex = rf.lastIncludedIndex
+	rf.lastApplied = rf.lastIncludedIndex
+	rf.readPersistSnapshot(rf.persister.ReadSnapshot(), applyCh)
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
@@ -592,4 +605,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	//go rf.applyFromQ(applyCh)
 
 	return rf
+}
+
+// restore previously persisted snapshot
+// Can only be called in the start of make
+func (rf *Raft) readPersistSnapshot(data []byte, applyCh chan ApplyMsg) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		MyDebug(dSnap, "S%d no previous information found for snapshot", rf.me)
+		return
+	}
+
+	// We have data for the snapshot
+	// Send a snapshot to the applyCh
+	msg := ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: true,
+		Snapshot:      data,
+		SnapshotTerm:  rf.lastIncludedTerm,
+		SnapshotIndex: rf.lastIncludedIndex,
+	}
+	// Reset the sentIndex
+	applyCh <- msg
 }

@@ -58,8 +58,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	MyDebug(dTrace, "S%d tries to acquire lock in RV handler", rf.me)
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	defer MyDebug(dTrace, "S%d release the lock in RV handler", rf.me)
+	defer rf.mu.Unlock()
 
 	rf.checkTerm(args.Term)
 	if args.Term < rf.currentTerm {
@@ -126,8 +126,8 @@ func (rf *Raft) broadcastRV() {
 				// Check the term
 				MyDebug(dTrace, "S%d tries to acquire the lock in MHRV", rf.me)
 				rf.mu.Lock()
-				defer rf.mu.Unlock()
 				defer MyDebug(dTrace, "S%d release the lock in MHRV", rf.me)
+				defer rf.mu.Unlock()
 
 				if rf.checkTerm(reply.Term) {
 					//reply.Term is greater than our term, back to follower
