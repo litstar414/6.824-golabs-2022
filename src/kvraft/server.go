@@ -38,10 +38,12 @@ type KVServer struct {
 }
 
 
+// Get rpc handler
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 }
 
+// PutAppend handler
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 }

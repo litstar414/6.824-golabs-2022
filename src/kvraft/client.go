@@ -10,6 +10,7 @@ type Clerk struct {
 	// You will have to modify this struct.
 }
 
+// Generate a random number
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
@@ -17,6 +18,7 @@ func nrand() int64 {
 	return x
 }
 
+// Create a clerk which can communicate with client
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
