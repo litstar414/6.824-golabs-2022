@@ -4,10 +4,22 @@ import "6.824/labrpc"
 import "crypto/rand"
 import "math/big"
 
+/*
+Some important notes:
+The clerk is attached to the application, all the calls to the get/put/append function
+are not happening in parallel.  These functions are not rpcs
+*/
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	// Record the latest leaderId we have seen
+	leaderId int
+	// client_id is the id of the clerk, used with seq_num to identify a request
+	client_id int
+	// Monotonically increasing, assign to all the operations that are not
+	// idempotent so that they are executed exactly-once
+	seq_num int
 }
 
 // Generate a random number
@@ -23,6 +35,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.leaderId = 0
+	ck.client_id = int(nrand())
+	ck.seq_num = 0
 	return ck
 }
 
