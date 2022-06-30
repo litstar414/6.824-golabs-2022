@@ -1,8 +1,19 @@
 package kvraft
 
-import "6.824/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"time"
+
+	"6.824/labrpc"
+)
+
+type OPTYPE int
+
+const (
+	GET       OPTYPE = 1
+	PUTAPPEND OPTYPE = 2
+)
 
 /*
 Some important notes:
@@ -21,6 +32,8 @@ type Clerk struct {
 	// idempotent so that they are executed exactly-once
 	seq_num int
 }
+
+const RETRY_INTERVAL = 150
 
 // Generate a random number
 func nrand() int64 {
@@ -41,6 +54,45 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	return ck
 }
 
+func (ck *Clerk) sendCommands(fname string, args interface{}, opt OPTYPE) interface{} {
+	var ok bool
+	var err Err
+	var result interface{}
+
+	for {
+		if opt == GET {
+			a := args.(GetArgs)
+			r := GetReply{}
+			ok = ck.servers[ck.leaderId].Call(fname, &a, &r)
+			err = r.Err
+			result = r
+		} else if opt == PUTAPPEND {
+			a := args.(PutAppendArgs)
+			r := PutAppendReply{}
+			ok = ck.servers[ck.leaderId].Call(fname, &a, &r)
+			err = r.Err
+			result = r
+		}
+		if ok == true && err != ErrWrongLeader {
+			// Success.
+			return result
+		}
+
+		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		if ok != true {
+			// The correspongding rpc to the kvserver fails, we probably encounters
+			// a network partition between the clerk and the kvservers
+			// Simply try another one
+			time.Sleep(RETRY_INTERVAL * time.Millisecond)
+			continue
+		}
+
+		// err == ErrWrongLeader
+		// We have a short sleep here, because there is no network issues
+		time.Sleep(15 * time.Millisecond)
+	}
+}
+
 //
 // fetch the current value for a key.
 // returns "" if the key does not exist.
@@ -56,7 +108,20 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	// Generate GetArgs
+	// Idealy, we don't need to assign seq_num for get requests
+	args := GetArgs{
+		Key:       key,
+		Client_id: ck.client_id,
+		Seq_num:   ck.seq_num,
+	}
+	ck.seq_num += 1
+
+	r := ck.sendCommands("KVServer.Get", args, GET)
+	reply := r.(GetReply)
+
+	DPrintf("client[%d] get(%s)=%s", ck.client_id, key, reply.Value)
+	return reply.Value
 }
 
 //
@@ -71,6 +136,22 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key:       key,
+		Value:     value,
+		Op:        op,
+		Client_id: ck.client_id,
+		Seq_num:   ck.seq_num,
+	}
+
+	ck.seq_num += 1
+	ck.sendCommands("KVServer.PutAppend", args, PUTAPPEND)
+
+	if op == "Put" {
+		DPrintf("client[%d] put(%s)=%s", ck.client_id, key, value)
+	} else {
+		DPrintf("client[%d] append(%s)=%s", ck.client_id, key, value)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
