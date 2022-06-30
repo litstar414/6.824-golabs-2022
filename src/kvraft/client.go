@@ -13,6 +13,7 @@ type OPTYPE int
 const (
 	GET       OPTYPE = 1
 	PUTAPPEND OPTYPE = 2
+	PUT       OPTYPE = 3
 )
 
 /*

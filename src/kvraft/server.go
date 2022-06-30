@@ -22,6 +22,16 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Client_id int
+	Seq_num   int
+	Key       string
+	Value     string
+	Opt       OPTYPE
+}
+
+type Result struct {
+	Value string
+	Err   Err
 }
 
 type KVServer struct {
@@ -34,16 +44,87 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	lastSeenTable map[int]Pair
+	notifyCh      map[int](chan Result)
+}
+
+func (kv *KVServer) registerWaitCh(cid int, ch chan Result) {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.notifyCh[cid] = ch
 }
 
 // Get rpc handler
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+
+	// First check if the request is duplicate
+	result := kv.checkIfDuplicate(args.Client_id, args.Seq_num)
+	if result != nil {
+		t := result.(GetReply)
+		reply.Value = t.Value
+		reply.Err = t.Err
+		return
+	}
+	// If not, extract the arguments, generate a Op operation.
+	op := Op{
+		Client_id: args.Client_id,
+		Seq_num:   args.Seq_num,
+		Key:       args.Key,
+		Opt:       GET,
+	}
+	// Call Start()
+	// TODO: decide whether we need these two arguments
+	_, _, isLeader := kv.rf.Start(op)
+	// Handle error case in start
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// Wait on a channel
+	waitCh := make(chan Result)
+	kv.registerWaitCh(args.Client_id, waitCh)
+	res := <-waitCh
+	// Return
+	reply.Value = res.Value
+	reply.Err = res.Err
 }
 
 // PutAppend handler
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	result := kv.checkIfDuplicate(args.Client_id, args.Seq_num)
+	if result != nil {
+		t := result.(PutAppendReply)
+		reply.Err = t.Err
+		return
+	}
+	// If not, extract the arguments, generate a Op operation.
+	op := Op{
+		Client_id: args.Client_id,
+		Seq_num:   args.Seq_num,
+		Key:       args.Key,
+		Value:     args.Value,
+	}
+	if args.Op == "Put" {
+		op.Opt = PUT
+	} else {
+		op.Opt = PUTAPPEND
+	}
+	// Call Start()
+	// TODO: decide whether we need these two arguments
+	_, _, isLeader := kv.rf.Start(op)
+	// Handle error case in start
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// Wait on a channel
+	waitCh := make(chan Result)
+	kv.registerWaitCh(args.Client_id, waitCh)
+	res := <-waitCh
+	// Return
+	reply.Err = res.Err
 }
 
 //
@@ -65,6 +146,25 @@ func (kv *KVServer) Kill() {
 func (kv *KVServer) killed() bool {
 	z := atomic.LoadInt32(&kv.dead)
 	return z == 1
+}
+
+// If duplicate, return the result.
+// Otherwise, return nil
+func (kv *KVServer) checkIfDuplicate(cid, seq_num int) interface{} {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	pair, ok := kv.lastSeenTable[cid]
+	if !ok {
+		// This is the first request from the client
+		return nil
+	}
+	if seq_num == pair.Seq_num {
+		return pair.Result
+	} else if seq_num < pair.Seq_num {
+		panic("Unexpected seq_num")
+	}
+	return nil
 }
 
 //
@@ -96,6 +196,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-
+	kv.lastSeenTable = make(map[int]Pair)
+	kv.notifyCh = make(map[int](chan Result))
 	return kv
 }

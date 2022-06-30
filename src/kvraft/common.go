@@ -20,6 +20,11 @@ type PutAppendArgs struct {
 	// otherwise RPC will break.
 }
 
+type Pair struct {
+	Seq_num int
+	Result  interface{}
+}
+
 type PutAppendReply struct {
 	Err Err
 }
