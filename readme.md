@@ -6,3 +6,5 @@
 - - [x] lab2B commit:e3db8e6
 - - [x] lab2C commit:e4cc545
 - - [x] lab2D commit:1664810
+- [x] lab3 kv service
+- - [x] lab3A commit:49dc605
