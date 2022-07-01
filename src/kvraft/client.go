@@ -64,14 +64,12 @@ func (ck *Clerk) sendCommands(fname string, args interface{}, opt OPTYPE) interf
 		if opt == GET {
 			a := args.(GetArgs)
 			r := GetReply{}
-			DPrintf("client[%d]: call with arg:%v", ck.client_id, a)
 			ok = ck.servers[ck.leaderId].Call(fname, &a, &r)
 			err = r.Err
 			result = r
 		} else if opt == PUTAPPEND {
 			a := args.(PutAppendArgs)
 			r := PutAppendReply{}
-			DPrintf("client[%d]: call with arg:%v", ck.client_id, a)
 			ok = ck.servers[ck.leaderId].Call(fname, &a, &r)
 			err = r.Err
 			result = r
@@ -81,15 +79,12 @@ func (ck *Clerk) sendCommands(fname string, args interface{}, opt OPTYPE) interf
 			return result
 		}
 		if !ok {
-			DPrintf("client[%d]: call fails", ck.client_id)
+			DPrintf("client[%d]: call fails(server %d)", ck.client_id, ck.leaderId)
 		} else {
-			DPrintf("client[%d]: Encounter error:%s", ck.client_id, err)
+			DPrintf("client[%d]: Encounter error:%s (server%d)", ck.client_id, err, ck.leaderId)
 		}
 
-		DPrintf("client[%d] original lid:%d", ck.client_id, ck.leaderId)
-
 		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-		DPrintf("client[%d] unsuccess operation, try server:%d", ck.client_id, ck.leaderId)
 		time.Sleep(RETRY_INTERVAL * time.Millisecond)
 	}
 }

@@ -12,7 +12,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -49,12 +49,12 @@ type KVServer struct {
 
 	// Your definitions here.
 	lastSeenTable map[int]Pair
-	notifyCh      map[int](chan Result)
-	lastApplied   int
-	state         map[string]string
+	//notifyCh      map[int](chan Result)
+	notifyCh    map[int]WaitCh
+	lastApplied int
+	state       map[string]string
 }
 
-// Invoked on a single thread, so no lock required
 // The op must be a verified operation
 func (kv *KVServer) applyOp(op Op) Result {
 	r := Result{}
@@ -130,11 +130,10 @@ func (kv *KVServer) monitorApplyCh() {
 		kv.mu.Lock()
 		kv.lastSeenTable[op.Client_id] = pair
 		// When we finally tries to send the command back to the client, is it still the command the client is expecting?
-		// Consider the case, the original client sends the request to the minority leader, and register a command
-		_, ok := kv.notifyCh[op.Client_id]
-		if ok {
+		waitCh, ok := kv.notifyCh[op.Client_id]
+		if ok && waitCh.Seq_num == op.Seq_num {
 			select {
-			case kv.notifyCh[op.Client_id] <- res:
+			case kv.notifyCh[op.Client_id].Ch <- res:
 			case <-time.After(250 * time.Millisecond):
 				kv.mu.Unlock()
 				continue
@@ -144,10 +143,13 @@ func (kv *KVServer) monitorApplyCh() {
 	}
 }
 
-func (kv *KVServer) registerWaitCh(cid int, ch chan Result) {
+func (kv *KVServer) registerWaitCh(cid int, seq_num int, ch chan Result) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	kv.notifyCh[cid] = ch
+	kv.notifyCh[cid] = WaitCh{
+		Seq_num: seq_num,
+		Ch:      ch,
+	}
 }
 
 func (kv *KVServer) unregisterWaitCh(cid int) {
@@ -179,7 +181,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		Opt:       GET,
 	}
 	// Call Start()
-	// TODO: decide whether we need these two arguments
 	_, _, isLeader := kv.rf.Start(op)
 	// Handle error case in start
 	if !isLeader {
@@ -188,16 +189,16 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	// Wait on a channel
 	waitCh := make(chan Result)
-	kv.registerWaitCh(args.Client_id, waitCh)
+	kv.registerWaitCh(args.Client_id, args.Seq_num, waitCh)
 	// Yes, we need timeout here, otherwise, if we ends up in the minority
 	// and the leader believes that it is the leader, then we cannot progress
 	// We need timeout to pass test in TestOnePartition3A
 	select {
 	case res := <-waitCh:
 		if res.Opt != GET {
-			fmt.Printf("Bad Opt:%d", res.Opt)
-			panic("Get rpc get Other result")
+			panic("Get rpc get put result")
 		}
+		DPrintf("server[%d] get(%s)=%s", kv.me, args.Key, res.Value)
 		reply.Value = res.Value
 		reply.Err = res.Err
 		kv.unregisterWaitCh(args.Client_id)
@@ -213,7 +214,6 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 // PutAppend handler
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	DPrintf("server[%d] put command received:%v", kv.me, args)
 	result := kv.checkIfDuplicate(args.Client_id, args.Seq_num)
 	if result != nil {
 		t := result.(Result)
@@ -233,7 +233,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		op.Opt = PUTAPPEND
 	}
 	// Call Start()
-	// TODO: decide whether we need these two arguments
 	_, _, isLeader := kv.rf.Start(op)
 	// Handle error case in start
 	if !isLeader {
@@ -247,10 +246,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	// Wait on a channel
 	waitCh := make(chan Result)
-	kv.registerWaitCh(args.Client_id, waitCh)
-	//DPrintf("client[%d] wait channel registerred", op.Client_id)
+	kv.registerWaitCh(args.Client_id, args.Seq_num, waitCh)
 	select {
 	case res := <-waitCh:
+		if res.Opt != PUT && res.Opt != PUTAPPEND {
+			panic("put rpc get get result")
+		}
 		reply.Err = res.Err
 		kv.unregisterWaitCh(args.Client_id)
 		return
@@ -333,7 +334,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.lastSeenTable = make(map[int]Pair)
-	kv.notifyCh = make(map[int](chan Result))
+	kv.notifyCh = make(map[int]WaitCh)
 	kv.lastApplied = 0
 	kv.state = make(map[string]string)
 
