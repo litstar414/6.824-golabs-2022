@@ -64,33 +64,33 @@ func (ck *Clerk) sendCommands(fname string, args interface{}, opt OPTYPE) interf
 		if opt == GET {
 			a := args.(GetArgs)
 			r := GetReply{}
+			DPrintf("client[%d]: call with arg:%v", ck.client_id, a)
 			ok = ck.servers[ck.leaderId].Call(fname, &a, &r)
 			err = r.Err
 			result = r
 		} else if opt == PUTAPPEND {
 			a := args.(PutAppendArgs)
 			r := PutAppendReply{}
+			DPrintf("client[%d]: call with arg:%v", ck.client_id, a)
 			ok = ck.servers[ck.leaderId].Call(fname, &a, &r)
 			err = r.Err
 			result = r
 		}
-		if ok == true && err != ErrWrongLeader {
-			// Success.
+
+		if ok == true && (err == OK || err == ErrNoKey) {
 			return result
 		}
-
-		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
-		if ok != true {
-			// The correspongding rpc to the kvserver fails, we probably encounters
-			// a network partition between the clerk and the kvservers
-			// Simply try another one
-			time.Sleep(RETRY_INTERVAL * time.Millisecond)
-			continue
+		if !ok {
+			DPrintf("client[%d]: call fails", ck.client_id)
+		} else {
+			DPrintf("client[%d]: Encounter error:%s", ck.client_id, err)
 		}
 
-		// err == ErrWrongLeader
-		// We have a short sleep here, because there is no network issues
-		time.Sleep(15 * time.Millisecond)
+		DPrintf("client[%d] original lid:%d", ck.client_id, ck.leaderId)
+
+		ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+		DPrintf("client[%d] unsuccess operation, try server:%d", ck.client_id, ck.leaderId)
+		time.Sleep(RETRY_INTERVAL * time.Millisecond)
 	}
 }
 

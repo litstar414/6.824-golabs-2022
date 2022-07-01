@@ -4,6 +4,7 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	TimeOut        = "TimeOut"
 )
 
 type Err string
@@ -27,6 +28,11 @@ type Pair struct {
 
 type PutAppendReply struct {
 	Err Err
+}
+
+type WaitCh struct {
+	Ch      chan Result
+	Seq_num int
 }
 
 type GetArgs struct {
