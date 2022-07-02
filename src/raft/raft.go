@@ -200,6 +200,13 @@ func (rf *Raft) converToCandidate() {
 	rf.broadcastRV()
 }
 
+// Do we need lock here?
+func (rf *Raft) GetStateSize() int {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.persister.RaftStateSize()
+}
+
 // Invoke this function should held the lock
 // Before return from this function, the lock should be held
 func (rf *Raft) leaderInitialize() {
@@ -210,7 +217,7 @@ func (rf *Raft) leaderInitialize() {
 		rf.nextIndex[i] = len(rf.log) + rf.lastIncludedIndex
 		rf.matchIndex[i] = 0
 	}
-
+	MyDebug(dCommit, "S%d after leader initialize nextIndex:%v", rf.me, rf.nextIndex)
 	rf.broadcastAE()
 	rf.lastReset = time.Now()
 	go rf.updateLeaderCommit(rf.currentTerm)
@@ -600,7 +607,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Potentially set lastApplied and commitIndex to 0
 
 	rf.readPersistSnapshot(rf.persister.ReadSnapshot(), applyCh, lastIncludedIndex, lastIncludedTerm)
-
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.sendCommands(applyCh)

@@ -39,6 +39,23 @@ type Result struct {
 	Opt   OPTYPE
 }
 
+//TODO: adjust this THREASHOLD
+const THREASHOLD int = 5
+
+// No lock needed
+func (kv *KVServer) testIfNeedSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+
+	stateSize := kv.rf.GetStateSize()
+
+	if stateSize >= kv.maxraftstate || kv.maxraftstate-stateSize <= THREASHOLD {
+		return true
+	}
+	return false
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -125,7 +142,24 @@ func (kv *KVServer) monitorApplyCh() {
 		msg := <-kv.applyCh
 
 		if !msg.CommandValid {
-			// TODO: temporally ignore here
+			// Test if it is a snapshot
+			if !msg.SnapshotValid {
+				panic("Unexpected applyMsg")
+			}
+
+			DPrintf("snapshot[%d] received snapshot from raft with index:%d, compared to lastApplied:%v", kv.me, msg.SnapshotIndex, kv.lastApplied)
+			// Only apply the snapshot if we see a bigger index
+			if msg.SnapshotIndex <= kv.lastApplied {
+				continue
+			}
+			kv.mu.Lock()
+			DPrintf("snapshot[%d] before->lastApplied:%d, state:%v, lastSeenTable:%v", kv.me, kv.lastApplied, kv.state, kv.lastSeenTable)
+			kv.decodeSnapshot(msg.Snapshot)
+			DPrintf("snapshot[%d] decode finished", kv.me)
+			DPrintf("snapshot[%d] after->lastApplied:%d, state:%v, lastSeenTable:%v", kv.me, kv.lastApplied, kv.state, kv.lastSeenTable)
+			kv.mu.Unlock()
+			// Send command back to raft module
+			kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot)
 			continue
 		}
 
@@ -139,14 +173,24 @@ func (kv *KVServer) monitorApplyCh() {
 			panic("Unexpected command order")
 		}
 
+		// Let's test for snapshot here
+		if kv.testIfNeedSnapshot() {
+			// Call snapshot function, need to first encode it
+			// as lastSeenTable is only modified in this thread, it is safe to read it without holding the lock
+			DPrintf("snapshot[%d] sends snapshot to raft", kv.me)
+			snapshot := kv.encodeSnapshot()
+			kv.rf.Snapshot(kv.lastApplied, snapshot)
+		}
+
 		// Is a valid command, get the op from it
 		op := msg.Command.(Op)
 		DPrintf("server[%d] op received in applyCh:%v", kv.me, op)
 
+		// Increase the lastApplied
+		kv.lastApplied = msg.CommandIndex
 		// Duplicate log?
 		if kv.checkIfDuplicate(op.Client_id, op.Seq_num) != nil {
 			DPrintf("server[%d] in monitorApplyCh", kv.me)
-			kv.lastApplied = msg.CommandIndex
 			continue
 		}
 
@@ -156,9 +200,6 @@ func (kv *KVServer) monitorApplyCh() {
 			Seq_num: op.Seq_num,
 			Result:  res,
 		}
-
-		// Increase the lastApplied
-		kv.lastApplied = msg.CommandIndex
 
 		kv.mu.Lock()
 		kv.lastSeenTable[op.Client_id] = pair
@@ -377,12 +418,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	/*kv.lastApplied = 15*/
 	/*kv.state["foo"] = "bar"*/
 	/*kv.lastSeenTable[2] = Pair{*/
-		/*Seq_num: 12,*/
-		/*Result: Result{*/
-			/*Value: "wow",*/
-			/*Err:   OK,*/
-			/*Opt:   PUTAPPEND,*/
-		/*},*/
+	/*Seq_num: 12,*/
+	/*Result: Result{*/
+	/*Value: "wow",*/
+	/*Err:   OK,*/
+	/*Opt:   PUTAPPEND,*/
+	/*},*/
 	/*}*/
 
 	/*snapshot := kv.encodeSnapshot()*/

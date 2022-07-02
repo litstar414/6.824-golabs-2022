@@ -46,7 +46,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 
 	// Send the snapshot to applyCh
-	MyDebug(dSnap, "S%d sends a snapshot to applyCh in installSnapshot rpc", rf.me)
+	MyDebug(dSnap, "S%d sends a snapshot(lastII:%d) to applyCh in installSnapshot rpc", rf.me, args.LastIncludedIndex)
 	go func() {
 		rf.applyCh <- ApplyMsg{
 			CommandValid:  false,
@@ -185,5 +185,9 @@ func (rf *Raft) handleISReply(server int, args *InstallSnapshotArgs, reply *Inst
 
 	// Update matchIndex and nextIndex
 	rf.nextIndex[server] = max(rf.nextIndex[server], args.LastIncludedIndex+1)
+	// TODO: later check
+	//rf.nextIndex[server] = args.LastIncludedIndex + 1
 	rf.matchIndex[server] = max(rf.matchIndex[server], args.LastIncludedIndex)
+	MyDebug(dSnap, "S%d snapshot after updates nextIndex:%v", rf.me, rf.nextIndex)
+	MyDebug(dSnap, "S%d after updates matchIndex:%v", rf.me, rf.matchIndex)
 }

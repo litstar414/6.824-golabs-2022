@@ -67,7 +67,7 @@ func (rf *Raft) handleAEReply(server int, args *AppendEntryArgs, reply *AppendEn
 			rf.nextIndex[server] = reply.SuggestNext
 		}
 	}
-
+	MyDebug(dSnap, "S%d handling ae reply(%d), nextIndex:%v", rf.me, server, rf.nextIndex)
 }
 
 // This function will send AE and handle the reply
@@ -105,8 +105,8 @@ func (rf *Raft) broadcastAE() {
 		//Prepare the arguments
 		PrevLogIndex := rf.nextIndex[i] - 1
 		if PrevLogIndex < rf.lastIncludedIndex {
-			MyDebug(dSnap, "S%d sends snapshot for server %d with lastIncludedIndex:%v",
-				rf.me, i, rf.lastIncludedIndex)
+			MyDebug(dSnap, "S%d sends snapshot for server %d with lastIncludedIndex:%v its nextIndex:%d, my lastII:%d",
+				rf.me, i, rf.lastIncludedIndex, rf.nextIndex[i], rf.lastIncludedIndex)
 			go rf.handleIS(i, rf.currentTerm, rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm, rf.persister.ReadSnapshot())
 			continue
 		}
@@ -149,6 +149,7 @@ func (rf *Raft) AppendEntry(args *AppendEntryArgs, reply *AppendEntryReply) {
 	if rf.lastIncludedIndex+len(rf.log)-1 < args.PrevLogIndex {
 		reply.Success = false
 		reply.SuggestNext = len(rf.log) + rf.lastIncludedIndex
+		MyDebug(dSnap, "S%d not have entry, my log:%v, my lastII:%d", rf.me, rf.log, rf.lastIncludedIndex)
 		return
 	}
 
