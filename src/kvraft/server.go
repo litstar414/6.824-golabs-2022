@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -53,6 +54,38 @@ type KVServer struct {
 	notifyCh    map[int]WaitCh
 	lastApplied int
 	state       map[string]string
+}
+
+func (kv *KVServer) encodeSnapshot() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.lastApplied)
+	e.Encode(kv.state)
+	e.Encode(kv.lastSeenTable)
+	data := w.Bytes()
+	return data
+}
+
+func (kv *KVServer) decodeSnapshot(data []byte) {
+	if data == nil || len(data) < 1 {
+		DPrintf("server[%d]: receive null snapshot", kv.me)
+		return
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var lastViewedTable map[int]Pair
+	var lastApplied int
+	var state map[string]string
+
+	if d.Decode(&lastApplied) != nil ||
+		d.Decode(&state) != nil ||
+		d.Decode(&lastViewedTable) != nil {
+		DPrintf("server[%d]: decode snapshot errors", kv.me)
+	} else {
+		kv.lastApplied = lastApplied
+		kv.lastSeenTable = lastViewedTable
+		kv.state = state
+	}
 }
 
 // The op must be a verified operation
@@ -322,6 +355,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(Result{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -337,6 +371,30 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.notifyCh = make(map[int]WaitCh)
 	kv.lastApplied = 0
 	kv.state = make(map[string]string)
+
+	//======================== small test======================
+
+	/*kv.lastApplied = 15*/
+	/*kv.state["foo"] = "bar"*/
+	/*kv.lastSeenTable[2] = Pair{*/
+		/*Seq_num: 12,*/
+		/*Result: Result{*/
+			/*Value: "wow",*/
+			/*Err:   OK,*/
+			/*Opt:   PUTAPPEND,*/
+		/*},*/
+	/*}*/
+
+	/*snapshot := kv.encodeSnapshot()*/
+	/*kv.lastApplied = 0*/
+	/*kv.state = make(map[string]string)*/
+	/*kv.lastSeenTable = make(map[int]Pair)*/
+
+	/*kv.decodeSnapshot(snapshot)*/
+	/*DPrintf("test->lastApplied:%d", kv.lastApplied)*/
+	/*DPrintf("test->state:%v", kv.state)*/
+	/*DPrintf("test->lastSeenTable:%v", kv.lastSeenTable)*/
+	//======================== ends ===========================
 
 	go kv.monitorApplyCh()
 	return kv
