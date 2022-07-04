@@ -8,3 +8,4 @@
 - - [x] lab2D commit:1664810
 - [x] lab3 kv service
 - - [x] lab3A commit:49dc605
+- - [x] lab3B commit:aaa85b7
