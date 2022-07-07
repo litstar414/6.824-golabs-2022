@@ -68,14 +68,47 @@ func (sc *ShardCtrler) checkIfDuplicate(cid, seq_num int) interface{} {
 	return nil
 }
 
-func (kv *ShardCtrler) applyOp(op Op) Result {
+// TODO: implement
+func reconfiguration(JoinedServers map[int][]string, LeftServers []int, origConfig Config) Config {
+	// TODO: ensure the function operates correct when configs has no groups
+	return Config{}
+}
+
+// TODO: Implement
+func moveTo(shard int, gid int, origConfig *Config) {
+
+}
+
+//TODO: Implement
+//This function will not change the config number.
+//The invoker should change it by themselves
+func copyConfig(config Config) Config {
+	return Config{}
+}
+
+func (sc *ShardCtrler) applyOp(op Op) Result {
 	r := Result{}
 	r.Opt = op.Opt
+	r.Err = OK
+	lastConfig := sc.configs[len(sc.configs)-1]
 	switch op.Opt {
 	case JOIN:
+		c := reconfiguration(op.JoinServers, nil, lastConfig)
+		sc.configs = append(sc.configs, c)
 	case LEAVE:
+		c := reconfiguration(nil, op.LeaveGroups, lastConfig)
+		sc.configs = append(sc.configs, c)
 	case QUERY:
+		if op.QueryNum == -1 || op.QueryNum >= len(sc.configs) {
+			r.Value = lastConfig
+		} else {
+			r.Value = sc.configs[op.QueryNum]
+		}
 	case MOVE:
+		c := copyConfig(lastConfig)
+		c.Num += 1
+		moveTo(op.FromShard, op.ToGroup, &c)
+		sc.configs = append(sc.configs, c)
 	}
 	return r
 }
