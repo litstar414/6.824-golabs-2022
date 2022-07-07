@@ -77,3 +77,19 @@ type QueryReply struct {
 	Err    Err
 	Config Config
 }
+
+type Pair struct {
+	Seq_num int
+	Result  interface{}
+}
+
+type WaitCh struct {
+	Ch      chan Result
+	Seq_num int
+}
+
+type Result struct {
+	Value Config
+	Err   Err
+	Opt   OPTYPE
+}
