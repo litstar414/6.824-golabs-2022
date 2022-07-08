@@ -2,7 +2,9 @@ package shardctrler
 
 import (
 	"bytes"
+	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -12,7 +14,7 @@ import (
 	"6.824/raft"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -64,26 +66,257 @@ func (sc *ShardCtrler) checkIfDuplicate(cid, seq_num int) interface{} {
 	} else if seq_num < pair.Seq_num {
 		panic("Unexpected seq_num")
 	}
-	DPrintf("server[%d] encounters a duplicate request cid:%d seq:%d", sc.me, cid, seq_num)
 	return nil
 }
 
-// TODO: implement
+func printConfig(c *Config) {
+	// map from gid -> shards
+	t := make(map[int]int)
+	unused := 0
+	for i := 0; i < NShards; i++ {
+		if c.Shards[i] == 0 {
+			unused += 1
+		} else {
+			gid := c.Shards[i]
+			if _, ok := t[gid]; ok {
+				t[gid] = t[gid] + 1
+			} else {
+				t[gid] = 1
+			}
+		}
+	}
+	for k := range c.Groups {
+		if _, ok := t[k]; !ok {
+			// we add it
+			t[k] = 0
+		}
+	}
+
+	keystring := ""
+	valuestring := ""
+	count := 0
+	for k, v := range t {
+		keystring += fmt.Sprint(k)
+		valuestring += fmt.Sprint(v)
+		count += 1
+		if count == len(t) {
+			break
+		}
+		keystring += "\t"
+		valuestring += "\t"
+	}
+	if Debug {
+		fmt.Printf("From gid -> assigned shards\n")
+		fmt.Printf("====================================\n")
+		fmt.Println(keystring)
+		fmt.Println(valuestring)
+		fmt.Printf("Unassigned shards:%d\n", unused)
+		fmt.Printf("====================================\n")
+	}
+}
+
+func removeServer(gid int, config *Config) {
+	// First reset Shards to zero
+	for i := 0; i < NShards; i++ {
+		if config.Shards[i] == gid {
+			config.Shards[i] = 0
+		}
+	}
+
+	// Now delete it
+	delete(config.Groups, gid)
+}
+
+// Return smallestIndex, biggestIndex
+func findSmallestBiggest(distribution map[int]int, gids []int) (int, int) {
+	smallestIndex := -1
+	smallestValue := 100000
+
+	biggestIndex := -1
+	biggestValue := -1
+
+	for _, k := range gids {
+		// k -> gid
+		if distribution[k] > biggestValue {
+			biggestValue = distribution[k]
+			biggestIndex = k
+		}
+		if distribution[k] < smallestValue {
+			smallestValue = distribution[k]
+			smallestIndex = k
+		}
+	}
+	return smallestIndex, biggestIndex
+}
+
+func findSmallestAvailableNum(servers map[int][]string) int {
+	i := 0
+	for ; i < len(servers); i++ {
+		if _, ok := servers[i]; !ok {
+			return i
+		}
+	}
+
+	return i
+}
+
 func reconfiguration(JoinedServers map[int][]string, LeftServers []int, origConfig Config) Config {
-	// TODO: ensure the function operates correct when configs has no groups
-	return Config{}
+	c := copyConfig(origConfig)
+	c.Num += 1
+	if JoinedServers != nil {
+		for k, v := range JoinedServers {
+			// If the current GID is in the servers, we need to assign a new one
+			if _, ok := c.Groups[k]; ok {
+				c.Groups[findSmallestAvailableNum(c.Groups)] = v
+			} else {
+				c.Groups[k] = v
+			}
+		}
+	}
+	if LeftServers != nil {
+		for i := 0; i < len(LeftServers); i++ {
+			removeServer(LeftServers[i], &c)
+		}
+	}
+
+	if len(c.Groups) == 0 {
+		DPrintf("Zero groups now, return")
+		return c
+	}
+
+	DPrintf("Before rebalance:")
+	printConfig(&c)
+
+	// Now we need to rebalance it
+	t := make(map[int]int)
+	unassigned := make([]int, 0)
+	// Deterministic step
+	for i := 0; i < NShards; i++ {
+		if c.Shards[i] == 0 {
+			unassigned = append(unassigned, i)
+		} else {
+			gid := c.Shards[i]
+			if _, ok := t[gid]; ok {
+				t[gid] = t[gid] + 1
+			} else {
+				t[gid] = 1
+			}
+		}
+	}
+
+	// Not deterministic
+	gids := make([]int, 0)
+	for k, _ := range c.Groups {
+		gids = append(gids, k)
+	}
+	sort.Ints(gids)
+
+	for i, k := range gids {
+		if _, ok := t[k]; !ok {
+			t[k] = 0
+		}
+		if i == 0 {
+			t[k] += len(unassigned)
+			for i := 0; i < len(unassigned); i++ {
+				c.Shards[unassigned[i]] = k
+			}
+			unassigned = unassigned[0:0]
+		}
+	}
+
+	if len(c.Groups) == 1 {
+		return c
+	}
+
+	totalGroups := len(c.Groups)
+	// We have "plusone" groups need to take NShards / totalGroups + 1 shards
+	plusOne := NShards % totalGroups
+	// We have "normal" groups need to take NShards / totalGroups shards
+	//normal := totalGroups - plusOne
+
+	if plusOne == 0 {
+		plusOne = 0
+	} else {
+		plusOne = 1
+	}
+
+	for {
+		smallestIndex, biggestIndex := findSmallestBiggest(t, gids)
+		diff := t[biggestIndex] - t[smallestIndex]
+		if diff == plusOne {
+			break
+		} else {
+			// Move one from server biggestIndex to smallestIndex
+			moveFromGtoG(biggestIndex, smallestIndex, &c)
+			t[biggestIndex] -= 1
+			t[smallestIndex] += 1
+		}
+	}
+
+	DPrintf("After reconfiguration:")
+	printConfig(&c)
+
+	return c
 }
 
-// TODO: Implement
+// Move one shard from group 1 to group 2
+func moveFromGtoG(g1, g2 int, config *Config) {
+	// Find a shard that belongs to g1
+	for i := 0; i < NShards; i++ {
+		if config.Shards[i] == g1 {
+			moveTo(i, g2, config)
+			return
+		}
+	}
+}
+
+func findUnbalancedServer(distribution map[int]int, threashold int) int {
+	// Firstly find a server with less than threashold, it cannot, find one with less than threashold + 1
+	smallestIndex := 0
+	smallestValue := 100000
+	for k, v := range distribution {
+		if v < threashold {
+			return k
+		}
+		if v < smallestValue {
+			smallestValue = v
+			smallestIndex = k
+		}
+	}
+	return smallestIndex
+}
+
 func moveTo(shard int, gid int, origConfig *Config) {
-
+	origConfig.Shards[shard] = gid
 }
 
-//TODO: Implement
+func copySlice(strings []string) []string {
+	t := make([]string, len(strings))
+	for i := 0; i < len(strings); i++ {
+		t[i] = strings[i]
+	}
+	return t
+}
+
 //This function will not change the config number.
 //The invoker should change it by themselves
 func copyConfig(config Config) Config {
-	return Config{}
+	c := Config{}
+	c.Num = config.Num
+
+	var shards [NShards]int
+	for i := 0; i < NShards; i++ {
+		shards[i] = config.Shards[i]
+	}
+
+	groups := make(map[int][]string)
+	for k, v := range config.Groups {
+		groups[k] = copySlice(v)
+	}
+
+	c.Shards = shards
+	c.Groups = groups
+	return c
 }
 
 func (sc *ShardCtrler) applyOp(op Op) Result {
@@ -128,7 +361,7 @@ func (sc *ShardCtrler) testIfNeedSnapshot() bool {
 
 func (sc *ShardCtrler) decodeSnapshot(data []byte) {
 	if data == nil || len(data) < 1 {
-		DPrintf("server[%d]: receive null snapshot", sc.me)
+		//DPrintf("server[%d]: receive null snapshot", sc.me)
 		return
 	}
 	r := bytes.NewBuffer(data)
@@ -140,7 +373,7 @@ func (sc *ShardCtrler) decodeSnapshot(data []byte) {
 	if d.Decode(&lastApplied) != nil ||
 		d.Decode(&configs) != nil ||
 		d.Decode(&lastViewedTable) != nil {
-		DPrintf("server[%d]: decode snapshot errors", sc.me)
+		//DPrintf("server[%d]: decode snapshot errors", sc.me)
 	} else {
 		sc.lastApplied = lastApplied
 		sc.lastSeenTable = lastViewedTable
@@ -214,7 +447,6 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 		sc.unregisterWaitCh(args.Client_id)
 		return
 	case <-time.After(500 * time.Millisecond):
-		DPrintf("server[%d] fails to reach majority", sc.me)
 		reply.Err = TimeOut
 		sc.unregisterWaitCh(args.Client_id)
 		return
@@ -259,7 +491,6 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 		sc.unregisterWaitCh(args.Client_id)
 		return
 	case <-time.After(500 * time.Millisecond):
-		DPrintf("server[%d] fails to reach majority", sc.me)
 		reply.Err = TimeOut
 		sc.unregisterWaitCh(args.Client_id)
 		return
@@ -305,7 +536,6 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 		sc.unregisterWaitCh(args.Client_id)
 		return
 	case <-time.After(500 * time.Millisecond):
-		DPrintf("server[%d] fails to reach majority", sc.me)
 		reply.Err = TimeOut
 		sc.unregisterWaitCh(args.Client_id)
 		return
@@ -351,7 +581,6 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 		sc.unregisterWaitCh(args.Client_id)
 		return
 	case <-time.After(500 * time.Millisecond):
-		DPrintf("server[%d] fails to reach majority", sc.me)
 		reply.Err = TimeOut
 		sc.unregisterWaitCh(args.Client_id)
 		return
@@ -391,9 +620,11 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.me = me
 	sc.maxraftstate = 10
 
-	// TODO: decide whether we should change this
 	sc.configs = make([]Config, 1)
 	sc.configs[0].Groups = map[int][]string{}
+	for i := 0; i < NShards; i++ {
+		sc.configs[0].Shards[i] = 0
+	}
 
 	labgob.Register(Op{})
 	labgob.Register(Result{})
@@ -420,7 +651,6 @@ func (sc *ShardCtrler) monitorApplyCh() {
 				panic("Unexpected applyMsg")
 			}
 
-			DPrintf("snapshot[%d] received snapshot from raft with index:%d, compared to lastApplied:%v", sc.me, msg.SnapshotIndex, sc.lastApplied)
 			// Only apply the snapshot if we see a bigger index
 			if msg.SnapshotIndex <= sc.lastApplied {
 				continue
@@ -446,7 +676,7 @@ func (sc *ShardCtrler) monitorApplyCh() {
 		if sc.testIfNeedSnapshot() {
 			// Call snapshot function, need to first encode it
 			// as lastSeenTable is only modified in this thread, it is safe to read it without holding the lock
-			DPrintf("snapshot[%d] sends snapshot to raft", sc.me)
+			//DPrintf("snapshot[%d] sends snapshot to raft", sc.me)
 			snapshot := sc.encodeSnapshot()
 			sc.rf.Snapshot(sc.lastApplied, snapshot)
 		}
@@ -459,7 +689,6 @@ func (sc *ShardCtrler) monitorApplyCh() {
 		sc.lastApplied = msg.CommandIndex
 		// Duplicate log?
 		if sc.checkIfDuplicate(op.Client_id, op.Seq_num) != nil {
-			DPrintf("server[%d] in monitorApplyCh", sc.me)
 			continue
 		}
 
