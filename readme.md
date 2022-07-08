@@ -9,3 +9,5 @@
 - [x] lab3 kv service
 - - [x] lab3A commit:49dc605
 - - [x] lab3B commit:aaa85b7
+- [x] lab4 sharded kv raft
+- - [x] lab4A commit:c849fcd
