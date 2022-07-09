@@ -28,6 +28,14 @@ func key2shard(key string) int {
 	return shard
 }
 
+type OPTYPE int
+
+const (
+	GET       OPTYPE = 1
+	PUTAPPEND OPTYPE = 2
+	PUT       OPTYPE = 3
+)
+
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
@@ -40,7 +48,11 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	client_id int
+	seq_num   int
 }
+
+const RETRY_INTERVAL = 100
 
 //
 // the tester calls MakeClerk.
@@ -56,7 +68,53 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.client_id = int(nrand())
+	ck.seq_num = 0
 	return ck
+}
+
+func (ck *Clerk) sendCommands(fname string, args interface{}, opt OPTYPE, key string) interface{} {
+	var err Err
+	var result interface{}
+	//WARNING: ok reuse
+
+	for {
+		shard := key2shard(key)
+		gid := ck.config.Shards[shard]
+		if servers, ok := ck.config.Groups[gid]; ok {
+			for si := 0; si < len(servers); si++ {
+				srv := ck.make_end(servers[si])
+				if opt == GET {
+					a := args.(GetArgs)
+					r := GetReply{}
+					ok = srv.Call(fname, &a, &r)
+					err = r.Err
+					result = r
+				} else if opt == PUTAPPEND {
+					a := args.(PutAppendArgs)
+					r := PutAppendReply{}
+					ok = srv.Call(fname, &a, &r)
+					err = r.Err
+					result = r
+				}
+				if ok && (err == OK || err == ErrNoKey) {
+					return result
+				}
+
+				if ok && err == ErrWrongGroup {
+					break
+				}
+
+				// ErrWrongLeader
+				if ok && err == ErrWrongLeader {
+					time.Sleep(RETRY_INTERVAL * time.Millisecond)
+				}
+				// Not ok, retry immediately
+			}
+		}
+		time.Sleep(RETRY_INTERVAL * time.Millisecond)
+		ck.config = ck.sm.Query(-1)
+	}
 }
 
 //
@@ -68,31 +126,16 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
+	args.Client_id = ck.client_id
+	args.Seq_num = ck.seq_num
 
-	for {
-		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
-			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply GetReply
-				ok := srv.Call("ShardKV.Get", &args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					return reply.Value
-				}
-				if ok && (reply.Err == ErrWrongGroup) {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-		// ask controler for the latest configuration.
-		ck.config = ck.sm.Query(-1)
-	}
+	ck.seq_num += 1
 
-	return ""
+	r := ck.sendCommands("ShardKV.Get", args, GET, key)
+	reply := r.(GetReply)
+
+	DPrintf("client[%d] get(%s)=%s", ck.client_id, key, reply.Value)
+	return reply.Value
 }
 
 //
@@ -100,32 +143,21 @@ func (ck *Clerk) Get(key string) string {
 // You will have to modify this function.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
+	args := PutAppendArgs{
+		Key:       key,
+		Value:     value,
+		Op:        op,
+		Client_id: ck.client_id,
+		Seq_num:   ck.seq_num,
+	}
 
+	ck.seq_num += 1
+	ck.sendCommands("ShardKV.PutAppend", args, PUTAPPEND, key)
 
-	for {
-		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply PutAppendReply
-				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				if ok && reply.Err == OK {
-					return
-				}
-				if ok && reply.Err == ErrWrongGroup {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
-		// ask controler for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+	if op == "Put" {
+		DPrintf("client[%d] put(%s)=%s", ck.client_id, key, value)
+	} else {
+		DPrintf("client[%d] append(%s)=%s", ck.client_id, key, value)
 	}
 }
 
