@@ -17,6 +17,12 @@ const (
 	TimeOut        = "TImeOut"
 )
 
+type Result struct {
+	Value string
+	Err   Err
+	Opt   OPTYPE
+}
+
 type Err string
 
 // Put or Append
@@ -46,4 +52,13 @@ type GetArgs struct {
 type GetReply struct {
 	Err   Err
 	Value string
+}
+type Pair struct {
+	Seq_num int
+	Result  interface{}
+}
+
+type WaitCh struct {
+	Ch      chan Result
+	Seq_num int
 }
