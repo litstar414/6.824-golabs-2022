@@ -1,0 +1,99 @@
+New data structure for shardKV server:
+1. shardStatus map[shard#]->status
+status (
+  polling -> indicate that the shard is currently being polled
+  polled -> indicate that the polling of this shard has completed and the group can now begin to provide services
+  notavailable -> indicate that the current shard is not available and we are waiting for the group leader to poll it
+)
+2. deleteTable map[shard#]->config#, an entry in the deleteTable indicates that we should safely delete the stored shard data for shard x in config y
+3. currentConfig Config, store the current configuration
+4. lastConfig Config, use this for calculating gained shards and lost shards, used for reduce the burden of the ShardController
+5. struct shard, instead of using a big map for storing data, it is now better to use seperate data structure for storing data for each shard
+so that it is now convenient for operations like sending shards to other groups
+type Shard struct {
+  data map[string]string
+  config# int
+  lastSeenTable map[int]Pair
+}
+6. shardTable map[shard#]->shard, this data structure stores the shard data.
+7. more for Op, some opeartions should also be compatiable with the Op
+  i). send the new configuration to the applyCh, so that all the group members apply the Op at a fixed time
+  ii).after polling a shard, we should put the shard data into the Op and send it to the applyCh
+  iii).for entries in the deleteTable, after the rpc to the corresponding group is success, we generate an Op and send it to the applyCh so everyone 
+      can delete it
+
+  So we should add a new field to Op, and change op
+
+
+
+Some thoughts:
+1. The server keeps fetching newest configuration in a goroutine, once a new goroutine is found:
+  -> The leader(GetState) should generate a Op for it and call Starts
+    -> What if there is no leader at that moment?
+    -> We should keep trying, we keep the current config, once we see a bigger config number, we check if we are the leader and call starts
+2. Once a new configuration is found in the applyCh, do the following
+  i) calculate gained shards and lost shards
+  ii) for lost shards, we immediately set the shardTable[#] = false
+     -> we should also set the availableSnapshot[shard#] -> [config#, shardsnap]
+     -> TODO: decides when we should delete this information
+  iii) spawn go rountines to fetch the snapshot
+  iv) set currentConfig = latestConfig
+
+
+
+TODO:
+Process re-configuration one at a time, in order
+fetch shard rpc
+  This snapshot should retry indefinitely, and provide exactly-once semantic
+  args: i) current config number
+        ii) shard number
+
+  reply:i) Err if not success
+        ii) snapshot
+
+  upon receiving the snapshot, set the corresponding shardTable[shard#]=true
+  also, if we have a stale snapshot in the availableSnapshot table, just delete it.
+
+
+TODO:
+snapshot
+
+
+
+
+Get,Put,Append RPCs:
+1. we should ensure that this op is happening either before or after the current config, and no configuration changes happen in parallel
+kv.mu.Lock()
+check currentConfig == latestConfig, this check ensures that the shardTable is updated
+Generate the op, and call start
+kv.mu.Unlock()
+
+fetch rountine changes:
+1. Use the global lock instead of another lock
+  -> We should make it all happen in a deterministic order
+
+
+
+
+
+
+
+checkIfResponsible changes:
+1. check the latestConfig to see if we are responsible for this shard
+   && currentConfig.Num == latestConfig.Num && shardTable[shard#] == true
+
+
+
+
+applyCh rountine changes:
+1. We should check for duplicate configuration change, and only apply the configuration change with bigger config number(at most once)
+ -> The configuration fetch rountine may send the same configuration change multiple times
+    due to the issues like there is no leader at that moment, or stale leader
+2. Before we wanna apply a op, we should ensure that if one decides to apply that op, others should also apply that op
+ -> We ensure this in the rpc handler
+3. check for ops that we can not service and panic
+
+
+client changes:
+1. change the reponse for the ErrWrongGroup error
+  -> Possibily we need a new error, to make the client try again later and wait for a configuration change

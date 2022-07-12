@@ -51,7 +51,7 @@ type Op struct {
 
 type ShardKV struct {
 	sm           *shardctrler.Clerk
-	mu           sync.Mutex
+	mu           sync.RWMutex
 	me           int
 	rf           *raft.Raft
 	applyCh      chan raft.ApplyMsg
@@ -69,7 +69,6 @@ type ShardKV struct {
 	state       map[string]string
 
 	currentConfig shardctrler.Config
-	configLock    sync.Mutex
 
 	// TODO: decides whether we want to store the currentConfig
 	// TODO: decides whether we want to encode the currentConfig in the snapshot
@@ -92,8 +91,8 @@ func (kv *ShardKV) testIfNeedSnapshot() bool {
 // TODO: Consider the situation, we see fast configuration change.
 // now we are responsible for a shard, but we have not install its snapshot
 func (kv *ShardKV) checkIfResponsible(key string) bool {
-	kv.configLock.Lock()
-	defer kv.configLock.Unlock()
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
 
 	shard := key2shard(key)
 	if kv.currentConfig.Shards[shard] == kv.gid {
@@ -397,11 +396,11 @@ func (kv *ShardKV) killed() bool {
 func (kv *ShardKV) updateConfig() {
 	for kv.killed() == false {
 		c := kv.sm.Query(-1)
-		kv.configLock.Lock()
+		kv.mu.Lock()
 		if c.Num > kv.currentConfig.Num {
 			kv.currentConfig = c
 		}
-		kv.configLock.Unlock()
+		kv.mu.Unlock()
 		time.Sleep(80 * time.Millisecond)
 	}
 }
