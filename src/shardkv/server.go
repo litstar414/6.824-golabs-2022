@@ -11,7 +11,31 @@ import "bytes"
 import "fmt"
 import "time"
 
-const Debug = false
+type status int
+
+const (
+	POLLING      status = 1 //indicate that the shard is needed to be pulled
+	POLLED       status = 2 //indicate that the polling of this shard has completed and the group can now begin to provide services
+	NOTAVAILABLE status = 3 //indicate that the current shard is not available and we are waiting for the group leader to poll it
+	SERVICE      status = 4 //indicate that the current shard can provide service
+)
+
+type OpOperation int
+
+const (
+	NormalOp    OpOperation = 1
+	NewConfig   OpOperation = 2
+	InsertShard OpOperation = 3
+	DeleteShard OpOperation = 4
+)
+
+const CONFIG_INTERVAL = 80
+
+//TODO: Add currentConfig to the snapshot
+//TODO: Add shardStatus to the snapshot
+//TODO: Add shardTable to the snapshot
+//TODO: change the design of the snapshot
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -42,6 +66,10 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	OperationType OpOperation
+	// Field for NewConfig
+	NewConfig shardctrler.Config
+
 	Client_id int
 	Seq_num   int
 	Key       string
@@ -69,9 +97,19 @@ type ShardKV struct {
 	state       map[string]string
 
 	currentConfig shardctrler.Config
+	lastConfig    shardctrler.Config
 
-	// TODO: decides whether we want to store the currentConfig
-	// TODO: decides whether we want to encode the currentConfig in the snapshot
+	shardStatus map[int]status
+}
+
+// Read lock should be held for this function
+func (kv *ShardKV) testIfCanReConfig() bool {
+	for _, v := range kv.shardStatus {
+		if v != SERVICE {
+			return false
+		}
+	}
+	return true
 }
 
 func (kv *ShardKV) testIfNeedSnapshot() bool {
@@ -88,8 +126,6 @@ func (kv *ShardKV) testIfNeedSnapshot() bool {
 }
 
 // TODO: This check is not good, needs to be changed.
-// TODO: Consider the situation, we see fast configuration change.
-// now we are responsible for a shard, but we have not install its snapshot
 func (kv *ShardKV) checkIfResponsible(key string) bool {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
@@ -104,9 +140,7 @@ func (kv *ShardKV) checkIfResponsible(key string) bool {
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 
-	//TODO: Check if we can serve this request, based on the current configuration
-	//TODO: This check should held the lock, as there should be another thread tries to update it
-
+	//TODO: re-check the implementation of the check
 	if !kv.checkIfResponsible(args.Key) {
 		reply.Err = ErrWrongGroup
 		return
@@ -121,10 +155,11 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	}
 	// If not, extract the arguments, generate a Op operation.
 	op := Op{
-		Client_id: args.Client_id,
-		Seq_num:   args.Seq_num,
-		Key:       args.Key,
-		Opt:       GET,
+		OperationType: NormalOp,
+		Client_id:     args.Client_id,
+		Seq_num:       args.Seq_num,
+		Key:           args.Key,
+		Opt:           GET,
 	}
 	// Call Start()
 	_, _, isLeader := kv.rf.Start(op)
@@ -173,10 +208,11 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	// If not, extract the arguments, generate a Op operation.
 	op := Op{
-		Client_id: args.Client_id,
-		Seq_num:   args.Seq_num,
-		Key:       args.Key,
-		Value:     args.Value,
+		OperationType: NormalOp,
+		Client_id:     args.Client_id,
+		Seq_num:       args.Seq_num,
+		Key:           args.Key,
+		Value:         args.Value,
 	}
 	if args.Op == "Put" {
 		op.Opt = PUT
@@ -214,6 +250,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 }
 
+//TODO:change the snapshot
 func (kv *ShardKV) encodeSnapshot() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -247,6 +284,7 @@ func (kv *ShardKV) decodeSnapshot(data []byte) {
 }
 
 // The op must be a verified operation
+// TODO: change this so that we can use the shard
 func (kv *ShardKV) applyOp(op Op) Result {
 	r := Result{}
 	r.Opt = op.Opt
@@ -302,23 +340,7 @@ func (kv *ShardKV) monitorApplyCh() {
 
 		if !msg.CommandValid {
 			// Test if it is a snapshot
-			if !msg.SnapshotValid {
-				panic("Unexpected applyMsg")
-			}
-
-			DPrintf("snapshot[%d] received snapshot from raft with index:%d, compared to lastApplied:%v", kv.me, msg.SnapshotIndex, kv.lastApplied)
-			// Only apply the snapshot if we see a bigger index
-			if msg.SnapshotIndex <= kv.lastApplied {
-				continue
-			}
-			kv.mu.Lock()
-			DPrintf("snapshot[%d] before->lastApplied:%d, state:%v, lastSeenTable:%v", kv.me, kv.lastApplied, kv.state, kv.lastSeenTable)
-			kv.decodeSnapshot(msg.Snapshot)
-			DPrintf("snapshot[%d] decode finished", kv.me)
-			DPrintf("snapshot[%d] after->lastApplied:%d, state:%v, lastSeenTable:%v", kv.me, kv.lastApplied, kv.state, kv.lastSeenTable)
-			kv.mu.Unlock()
-			// Send command back to raft module
-			kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot)
+			kv.handleSnapshotMsg(msg)
 			continue
 		}
 
@@ -344,35 +366,17 @@ func (kv *ShardKV) monitorApplyCh() {
 		// Is a valid command, get the op from it
 		op := msg.Command.(Op)
 		DPrintf("server[%d] op received in applyCh:%v", kv.me, op)
-
 		// Increase the lastApplied
 		kv.lastApplied = msg.CommandIndex
-		// Duplicate log?
-		if kv.checkIfDuplicate(op.Client_id, op.Seq_num) != nil {
-			DPrintf("server[%d] in monitorApplyCh", kv.me)
+		switch op.OperationType {
+		case NormalOp:
+			kv.handleNormalOp(op)
+			continue
+		case NewConfig:
+			DPrintf("server[%d] new config received", kv.me)
+			kv.handleNewConfig(op)
 			continue
 		}
-
-		// Not duplicate, apply the op and record the result
-		res := kv.applyOp(op)
-		pair := Pair{
-			Seq_num: op.Seq_num,
-			Result:  res,
-		}
-
-		kv.mu.Lock()
-		kv.lastSeenTable[op.Client_id] = pair
-		// When we finally tries to send the command back to the client, is it still the command the client is expecting?
-		waitCh, ok := kv.notifyCh[op.Client_id]
-		if ok && waitCh.Seq_num == op.Seq_num {
-			select {
-			case kv.notifyCh[op.Client_id].Ch <- res:
-			case <-time.After(250 * time.Millisecond):
-				kv.mu.Unlock()
-				continue
-			}
-		}
-		kv.mu.Unlock()
 	}
 }
 
@@ -395,14 +399,150 @@ func (kv *ShardKV) killed() bool {
 
 func (kv *ShardKV) updateConfig() {
 	for kv.killed() == false {
-		c := kv.sm.Query(-1)
+		// Only the leader is responsible for updating the config
+		_, leader := kv.rf.GetState()
+		if !leader {
+			time.Sleep(CONFIG_INTERVAL * time.Millisecond)
+			continue
+		}
+
 		kv.mu.Lock()
-		if c.Num > kv.currentConfig.Num {
-			kv.currentConfig = c
+		// Check if we are now doing some reconfiguration
+		if !kv.testIfCanReConfig() {
+			kv.mu.Unlock()
+			time.Sleep(CONFIG_INTERVAL * time.Millisecond)
+			continue
+		}
+		c := kv.sm.Query(kv.currentConfig.Num + 1)
+		if c.Num == kv.currentConfig.Num+1 {
+			// We have successfully see a new config
+			// change currentConfig and lastConfig correspondingly
+			// Generate an reconfiguration op and send it to the applyCh
+			op := Op{
+				OperationType: NewConfig,
+				NewConfig:     c,
+			}
+			_, _, isLeader := kv.rf.Start(op)
+			if !isLeader {
+				kv.mu.Unlock()
+				time.Sleep(CONFIG_INTERVAL * time.Millisecond)
+				continue
+			}
 		}
 		kv.mu.Unlock()
-		time.Sleep(80 * time.Millisecond)
+		time.Sleep(CONFIG_INTERVAL * time.Millisecond)
 	}
+}
+
+//Add here
+
+func (kv *ShardKV) handleNormalOp(op Op) {
+	if kv.checkIfDuplicate(op.Client_id, op.Seq_num) != nil {
+		DPrintf("server[%d] in monitorApplyCh", kv.me)
+		return
+	} // Not duplicate, apply the op and record the result
+	res := kv.applyOp(op)
+	pair := Pair{
+		Seq_num: op.Seq_num,
+		Result:  res,
+	}
+	kv.mu.Lock()
+	kv.lastSeenTable[op.Client_id] = pair
+	// When we finally tries to send the command back to the client, is it still the command the client is expecting?
+	waitCh, ok := kv.notifyCh[op.Client_id]
+	if ok && waitCh.Seq_num == op.Seq_num {
+		select {
+		case kv.notifyCh[op.Client_id].Ch <- res:
+		case <-time.After(250 * time.Millisecond):
+			kv.mu.Unlock()
+			return
+		}
+	}
+	kv.mu.Unlock()
+}
+
+// Return the gained shards, no-change shards, and the lost shards
+func (kv *ShardKV) calculateShardChanges(origin shardctrler.Config, after shardctrler.Config) ([]int, []int, []int) {
+	gainedShards := make([]int, 0)
+	maintainedShards := make([]int, 0)
+	lostShards := make([]int, 0)
+	// My gid:
+	for i := 0; i < shardctrler.NShards; i++ {
+		if after.Shards[i] == kv.gid {
+			if origin.Shards[i] == kv.gid {
+				maintainedShards = append(maintainedShards, i)
+			} else {
+				gainedShards = append(gainedShards, i)
+			}
+		} else {
+			if origin.Shards[i] == kv.gid {
+				lostShards = append(lostShards, i)
+			}
+		}
+	}
+	return gainedShards, maintainedShards, lostShards
+}
+
+// No lock acquired for invoking this function
+func (kv *ShardKV) handleNewConfig(op Op) {
+	c := op.NewConfig
+	// We only try to apply new configs we have seen
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if kv.currentConfig.Num >= c.Num {
+		// This is a duplicate config, we don't need to do anything
+		return
+	}
+	if c.Num != kv.currentConfig.Num+1 {
+		fmt.Printf("Unexpected config number, expected:%d, got:%d\n", kv.currentConfig.Num+1, c.Num)
+	}
+
+	//TODO: delete this for better performance
+	if !kv.testIfCanReConfig() {
+		fmt.Printf("Unexpected reconfig, shard status:%v", kv.shardStatus)
+		panic("The last reconfiguration has not finished yet")
+	}
+
+	kv.lastConfig = kv.currentConfig
+	kv.currentConfig = c
+
+	// Update shard table and delete table
+	//TODO: change this
+	gainedShards, _, deleteShards := kv.calculateShardChanges(kv.lastConfig, kv.currentConfig)
+
+	for _, v := range deleteShards {
+		delete(kv.shardStatus, v)
+	}
+
+	for _, v := range gainedShards {
+		if kv.lastConfig.Num == 0 {
+			kv.shardStatus[v] = SERVICE
+		} else {
+			kv.shardStatus[v] = POLLING
+		}
+	}
+
+	DPrintf("server[%d] after reconfig:%v", kv.me, kv.shardStatus)
+}
+
+func (kv *ShardKV) handleSnapshotMsg(msg raft.ApplyMsg) {
+	if !msg.SnapshotValid {
+		panic("Unexpected applyMsg")
+	}
+
+	DPrintf("snapshot[%d] received snapshot from raft with index:%d, compared to lastApplied:%v", kv.me, msg.SnapshotIndex, kv.lastApplied)
+	// Only apply the snapshot if we see a bigger index
+	if msg.SnapshotIndex <= kv.lastApplied {
+		return
+	}
+	kv.mu.Lock()
+	DPrintf("snapshot[%d] before->lastApplied:%d, state:%v, lastSeenTable:%v", kv.me, kv.lastApplied, kv.state, kv.lastSeenTable)
+	kv.decodeSnapshot(msg.Snapshot)
+	DPrintf("snapshot[%d] decode finished", kv.me)
+	DPrintf("snapshot[%d] after->lastApplied:%d, state:%v, lastSeenTable:%v", kv.me, kv.lastApplied, kv.state, kv.lastSeenTable)
+	kv.mu.Unlock()
+	// Send command back to raft module
+	kv.rf.CondInstallSnapshot(msg.SnapshotTerm, msg.SnapshotIndex, msg.Snapshot)
 }
 
 //
@@ -460,7 +600,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.lastApplied = 0
 	kv.state = make(map[string]string)
 
-	kv.currentConfig = kv.sm.Query(-1)
+	kv.currentConfig = kv.sm.Query(0)
+	kv.lastConfig = kv.sm.Query(0)
+	kv.shardStatus = make(map[int]status)
 
 	go kv.monitorApplyCh()
 	go kv.updateConfig()
