@@ -121,7 +121,7 @@ type ShardKV struct {
 
 	shardStatus map[int]status
 	shardTable  map[int]Shard
-  restart bool
+	restart     bool
 }
 
 // Read lock should be held for this function
@@ -182,7 +182,7 @@ func copyShard(s Shard) Shard {
 
 //TODO: decide whether it is safe to not polling from the leader
 func (kv *ShardKV) PollRequest(args *PollArgs, reply *PollReply) {
-	DPrintf("server[%d:%d] pollrequest get called", kv.gid, kv.me)
+	DPrintf("server[%d:%d] pollrequest get called for shard in config%d:%d", kv.gid, kv.me, args.Shard, args.ConfigN)
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
 
@@ -194,8 +194,11 @@ func (kv *ShardKV) PollRequest(args *PollArgs, reply *PollReply) {
 
 	shard := kv.shardTable[args.Shard]
 	if shard.ConfigNum != args.ConfigN-1 {
-		fmt.Printf("Unexpected config num in poll request, expected:%d, got:%d", args.ConfigN-1, shard.ConfigNum)
-		panic("unexpected config num")
+		/*   fmt.Printf("Unexpected config num in poll request, expected:%d, got:%d", args.ConfigN-1, shard.ConfigNum)*/
+		/*panic("unexpected config num")*/
+		DPrintf("server[%d:%d] receives a stale pollrequest", kv.gid, kv.me)
+		reply.Err = TimeOut
+		return
 	}
 
 	// Success
@@ -318,8 +321,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 //TODO:change the snapshot
 func (kv *ShardKV) encodeSnapshot() []byte {
-  kv.mu.RLock()
-  defer kv.mu.RUnlock()
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.lastApplied)
@@ -352,20 +355,20 @@ func (kv *ShardKV) decodeSnapshot(data []byte) {
 		DPrintf("server[%d]: decode snapshot errors", kv.me)
 	} else {
 		kv.lastApplied = lastApplied
-    if kv.restart {
-      kv.restart = false
-      for k, v := range shardStatus {
-        if v == SERVICE {
-          kv.shardStatus[k] = SERVICE
-        } else if v == POLLING {
-          kv.shardStatus[k] = NOTAVAILABLE
-        } else {
-          kv.shardStatus[k] = v
-        }
-      }
-    } else {
-      kv.shardStatus = shardStatus
-    }
+		if kv.restart {
+			kv.restart = false
+			for k, v := range shardStatus {
+				if v == SERVICE {
+					kv.shardStatus[k] = SERVICE
+				} else if v == POLLING {
+					kv.shardStatus[k] = NOTAVAILABLE
+				} else {
+					kv.shardStatus[k] = v
+				}
+			}
+		} else {
+			kv.shardStatus = shardStatus
+		}
 		kv.shardTable = shardTable
 		kv.lastConfig = lastConfig
 		kv.currentConfig = currentConfig
@@ -461,11 +464,9 @@ func (kv *ShardKV) monitorApplyCh() {
 		kv.lastApplied = msg.CommandIndex
 		switch op.OperationType {
 		case NormalOp:
-			DPrintf("server[%d:%d] normal op received key:%v value:%v opt:%v", kv.gid, kv.me, op.Key, op.Value, op.Opt)
 			kv.handleNormalOp(op)
 			continue
 		case NewConfig:
-			DPrintf("server[%d:%d] new config received", kv.gid, kv.me)
 			kv.handleNewConfig(op)
 			continue
 		case InsertShard:
@@ -543,7 +544,7 @@ func (kv *ShardKV) pollShard(shard, configN int, servers []string) {
 						// The remote config is not updated
 						time.Sleep(100 * time.Millisecond)
 					} else {
-						panic("unexpected err")
+						return
 					}
 				} else {
 					DPrintf("server[%d:%d] remote rpc pollrequest fails", kv.gid, kv.me)
@@ -636,6 +637,7 @@ func (kv *ShardKV) handleNormalOp(op Op) {
 			return
 		}
 
+		DPrintf("server[%d:%d] normal op received key:%v value:%v opt:%v", kv.gid, kv.me, op.Key, op.Value, op.Opt)
 		res = kv.applyOp(op)
 		pair := Pair{
 			Seq_num: op.Seq_num,
@@ -691,6 +693,7 @@ func (kv *ShardKV) handleInsertShard(op Op) {
 	shardN := op.NewShardN
 
 	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	// Do we already get this shard?
 	if kv.shardStatus[shardN] == SERVICE {
 		return
@@ -708,7 +711,6 @@ func (kv *ShardKV) handleInsertShard(op Op) {
 	kv.shardTable[shardN] = myshard
 	kv.shardStatus[shardN] = SERVICE
 	DPrintf("server[%d:%d] install shard %d in config %d", kv.gid, kv.me, shardN, kv.currentConfig.Num)
-	defer kv.mu.Unlock()
 }
 
 // No lock acquired for invoking this function
@@ -725,6 +727,7 @@ func (kv *ShardKV) handleNewConfig(op Op) {
 		fmt.Printf("Unexpected config number, expected:%d, got:%d\n", kv.currentConfig.Num+1, c.Num)
 	}
 
+	DPrintf("server[%d:%d] new config received", kv.gid, kv.me)
 	//TODO: delete this for better performance
 	if !kv.testIfCanReConfig() {
 		fmt.Printf("Unexpected reconfig, shard status:%v", kv.shardStatus)
@@ -841,7 +844,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.lastConfig = kv.sm.Query(0)
 	kv.shardStatus = make(map[int]status)
 	kv.shardTable = make(map[int]Shard)
-  kv.restart = true
+	kv.restart = true
 
 	go kv.monitorApplyCh()
 	go kv.updateConfig()
