@@ -73,6 +73,7 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	return ck
 }
 
+//TODO: decide Err handling
 func (ck *Clerk) sendCommands(fname string, args interface{}, opt OPTYPE, key string) interface{} {
 	var err Err
 	var result interface{}
@@ -107,6 +108,10 @@ func (ck *Clerk) sendCommands(fname string, args interface{}, opt OPTYPE, key st
 
 				// ErrWrongLeader
 				if ok && err == ErrWrongLeader {
+					time.Sleep(50 * time.Millisecond)
+				}
+
+				if ok && err == ErrWait {
 					time.Sleep(RETRY_INTERVAL * time.Millisecond)
 				}
 				// Not ok, retry immediately

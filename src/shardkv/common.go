@@ -15,6 +15,7 @@ const (
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
 	TimeOut        = "TImeOut"
+	ErrWait        = "Wait"
 )
 
 type Result struct {
@@ -53,6 +54,17 @@ type GetReply struct {
 	Err   Err
 	Value string
 }
+
+type PollArgs struct {
+	Shard   int
+	ConfigN int
+}
+
+type PollReply struct {
+	Err   Err
+	Shard Shard
+}
+
 type Pair struct {
 	Seq_num int
 	Result  interface{}

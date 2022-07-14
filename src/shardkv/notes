@@ -4,6 +4,7 @@ status (
   polling -> indicate that the shard is currently being polled
   polled -> indicate that the polling of this shard has completed and the group can now begin to provide services
   notavailable -> indicate that the current shard is not available and we are waiting for the group leader to poll it
+  service -> indicate that this shard can provide service
 )
 2. deleteTable map[shard#]->config#, an entry in the deleteTable indicates that we should safely delete the stored shard data for shard x in config y
 3. currentConfig Config, store the current configuration
