@@ -1,15 +1,18 @@
 package shardkv
 
-import "6.824/labrpc"
-import "6.824/raft"
-import "sync"
-import "6.824/labgob"
-import "6.824/shardctrler"
-import "log"
-import "sync/atomic"
-import "bytes"
-import "fmt"
-import "time"
+import (
+	"bytes"
+	"fmt"
+	"log"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
+	"6.824/shardctrler"
+)
 
 type status int
 
@@ -35,7 +38,7 @@ const CONFIG_INTERVAL = 80
 //TODO: Add shardStatus to the snapshot
 //TODO: Add shardTable to the snapshot
 //TODO: change the design of the snapshot
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -118,6 +121,7 @@ type ShardKV struct {
 
 	shardStatus map[int]status
 	shardTable  map[int]Shard
+  restart bool
 }
 
 // Read lock should be held for this function
@@ -183,6 +187,7 @@ func (kv *ShardKV) PollRequest(args *PollArgs, reply *PollReply) {
 	defer kv.mu.RUnlock()
 
 	if args.ConfigN > kv.currentConfig.Num {
+		DPrintf("server[%d:%d] pollrequest not updated config number, args.ConfigN:%d, my configN:%d", kv.gid, kv.me, args.ConfigN, kv.currentConfig.Num)
 		reply.Err = ErrWait
 		return
 	}
@@ -313,6 +318,8 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 //TODO:change the snapshot
 func (kv *ShardKV) encodeSnapshot() []byte {
+  kv.mu.RLock()
+  defer kv.mu.RUnlock()
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(kv.lastApplied)
@@ -345,7 +352,20 @@ func (kv *ShardKV) decodeSnapshot(data []byte) {
 		DPrintf("server[%d]: decode snapshot errors", kv.me)
 	} else {
 		kv.lastApplied = lastApplied
-		kv.shardStatus = shardStatus
+    if kv.restart {
+      kv.restart = false
+      for k, v := range shardStatus {
+        if v == SERVICE {
+          kv.shardStatus[k] = SERVICE
+        } else if v == POLLING {
+          kv.shardStatus[k] = NOTAVAILABLE
+        } else {
+          kv.shardStatus[k] = v
+        }
+      }
+    } else {
+      kv.shardStatus = shardStatus
+    }
 		kv.shardTable = shardTable
 		kv.lastConfig = lastConfig
 		kv.currentConfig = currentConfig
@@ -525,8 +545,9 @@ func (kv *ShardKV) pollShard(shard, configN int, servers []string) {
 					} else {
 						panic("unexpected err")
 					}
+				} else {
+					DPrintf("server[%d:%d] remote rpc pollrequest fails", kv.gid, kv.me)
 				}
-				DPrintf("server[%d:%d] remote rpc pollrequest fails", kv.gid, kv.me)
 			}
 		}
 	}
@@ -820,6 +841,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.lastConfig = kv.sm.Query(0)
 	kv.shardStatus = make(map[int]status)
 	kv.shardTable = make(map[int]Shard)
+  kv.restart = true
 
 	go kv.monitorApplyCh()
 	go kv.updateConfig()
