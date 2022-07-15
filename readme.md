@@ -11,3 +11,4 @@
 - - [x] lab3B commit:aaa85b7
 - [x] lab4 sharded kv raft
 - - [x] lab4A commit:c849fcd
+- - [x] lab4B commit:7665667
