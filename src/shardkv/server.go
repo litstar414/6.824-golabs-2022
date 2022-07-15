@@ -180,11 +180,27 @@ func copyShard(s Shard) Shard {
 	return shard
 }
 
+func (kv *ShardKV) checkShardStatus(shard int) status {
+	kv.mu.RLock()
+	defer kv.mu.RUnlock()
+	return kv.shardStatus[shard]
+}
+
+func makeNilShard() Shard {
+	return Shard{
+		ConfigNum:     -1,
+		LastSeenTable: make(map[int]Pair),
+		State:         make(map[string]string),
+	}
+}
+
 //TODO: decide whether it is safe to not polling from the leader
 func (kv *ShardKV) PollRequest(args *PollArgs, reply *PollReply) {
 	DPrintf("server[%d:%d] pollrequest get called for shard in config%d:%d", kv.gid, kv.me, args.Shard, args.ConfigN)
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
+
+	reply.Shard = makeNilShard()
 
 	if args.ConfigN > kv.currentConfig.Num {
 		DPrintf("server[%d:%d] pollrequest not updated config number, args.ConfigN:%d, my configN:%d", kv.gid, kv.me, args.ConfigN, kv.currentConfig.Num)
@@ -192,10 +208,14 @@ func (kv *ShardKV) PollRequest(args *PollArgs, reply *PollReply) {
 		return
 	}
 
-	shard := kv.shardTable[args.Shard]
+	shard, ok := kv.shardTable[args.Shard]
+	// TODO: will later become work with deleteShard
+	if !ok {
+		DPrintf("server[%d:%d] receives a stale pollrequest with request info: %v", kv.gid, kv.me, *args)
+		reply.Err = TimeOut
+		return
+	}
 	if shard.ConfigNum != args.ConfigN-1 {
-		/*   fmt.Printf("Unexpected config num in poll request, expected:%d, got:%d", args.ConfigN-1, shard.ConfigNum)*/
-		/*panic("unexpected config num")*/
 		DPrintf("server[%d:%d] receives a stale pollrequest", kv.gid, kv.me)
 		reply.Err = TimeOut
 		return
@@ -354,6 +374,7 @@ func (kv *ShardKV) decodeSnapshot(data []byte) {
 		d.Decode(&currentConfig) != nil {
 		DPrintf("server[%d]: decode snapshot errors", kv.me)
 	} else {
+		DPrintf("server[%d:%d] applied snapshot with shardStatus:%v, currentConfig:%v", kv.gid, kv.me, shardStatus, currentConfig)
 		kv.lastApplied = lastApplied
 		if kv.restart {
 			kv.restart = false
@@ -517,7 +538,14 @@ func (kv *ShardKV) pollShard(shard, configN int, servers []string) {
 		DPrintf("server[%d:%d] begins to poll shard %d", kv.gid, kv.me, shard)
 		// I am the leader, poll the shard!
 		for {
+			// Keep polling until the shardstatus is correct
+			if kv.checkShardStatus(shard) == SERVICE {
+				return
+			}
 			for si := 0; si < len(servers); si++ {
+				if kv.checkShardStatus(shard) == SERVICE {
+					return
+				}
 				srv := kv.make_end(servers[si])
 				ok := srv.Call("ShardKV.PollRequest", &args, &reply)
 				if ok {
@@ -527,7 +555,7 @@ func (kv *ShardKV) pollShard(shard, configN int, servers []string) {
 						// Call start
 						op := Op{
 							OperationType: InsertShard,
-							NewShard:      reply.Shard,
+							NewShard:      copyShard(reply.Shard),
 							NewShardN:     shard,
 						}
 						_, _, leader := kv.rf.Start(op)
@@ -537,9 +565,8 @@ func (kv *ShardKV) pollShard(shard, configN int, servers []string) {
 								kv.shardStatus[shard] = NOTAVAILABLE
 							}
 						}
-						// As we successfully add it to our log, we can return now
 						kv.mu.Unlock()
-						return
+						time.Sleep(100 * time.Millisecond)
 					} else if reply.Err == ErrWait {
 						// The remote config is not updated
 						time.Sleep(100 * time.Millisecond)
@@ -728,7 +755,6 @@ func (kv *ShardKV) handleNewConfig(op Op) {
 	}
 
 	DPrintf("server[%d:%d] new config received", kv.gid, kv.me)
-	//TODO: delete this for better performance
 	if !kv.testIfCanReConfig() {
 		fmt.Printf("Unexpected reconfig, shard status:%v", kv.shardStatus)
 		panic("The last reconfiguration has not finished yet")
@@ -761,7 +787,7 @@ func (kv *ShardKV) handleNewConfig(op Op) {
 		}
 	}
 
-	DPrintf("server[%d:%d] after reconfig:%v", kv.gid, kv.me, kv.shardStatus)
+	DPrintf("server[%d:%d] after reconfig(%d):%v", kv.gid, kv.me, c.Num, kv.shardStatus)
 }
 
 func (kv *ShardKV) handleSnapshotMsg(msg raft.ApplyMsg) {
@@ -818,6 +844,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(Shard{})
 	labgob.Register(Pair{})
 	labgob.Register(shardctrler.Config{})
+	labgob.Register(Task{})
 
 	kv := new(ShardKV)
 	kv.me = me
